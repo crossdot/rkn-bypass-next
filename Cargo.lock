@@ -45,6 +45,7 @@ version = "0.1.0"
 name = "diag-cli"
 version = "0.1.0"
 dependencies = [
+ "config",
  "proxy-core",
  "rustls",
  "rustls-pemfile",

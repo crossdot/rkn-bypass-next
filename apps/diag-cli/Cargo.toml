@@ -14,3 +14,6 @@ rustls-pemfile = { workspace = true }
 transport-tls = { path = "../../crates/transport-tls" }
 proxy-core = { path = "../../crates/proxy-core" }
 socks5 = { path = "../../crates/socks5" }
+
+[dev-dependencies]
+config = { path = "../../crates/config" }
