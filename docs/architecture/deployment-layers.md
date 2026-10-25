@@ -34,3 +34,14 @@
   без изменений.
 - Смена контракта `Transport` (sync → async) — отдельное проектное
   решение, фиксируется ADR-017 до реализации.
+
+## Сертификаты и TLS-конфигурация
+- `transport-tls` получает `ClientConfig`/`ServerConfig` снаружи
+  и не управляет сертификатами.
+- CA + leaf, не self-signed: `rustls` отвергает CA-сертификат
+  в роли end-entity (`CaUsedAsEndEntity`).
+- Dev-сертификаты (`certs/dev-*.{crt,key}`) — только для тестов
+  и локального демо. В production — только через CI-secrets/env,
+  не в VCS.
+- Правило для агентов: не заменять CA + leaf на self-signed
+  «для простоты».
