@@ -23,3 +23,11 @@
   после Phase 2.
 - Profile B требует отдельного образа с nginx; он не является зависимостью
   образа Profile A.
+
+## Реализация
+- SBOM — `syft` в формате CycloneDX JSON, по digest образа; файлы
+  `rkn-{server,client}-<digest>.cdx.json` — в GitHub Actions artifacts.
+- Подпись — `cosign sign` keyless (OIDC GitHub Actions), по digest;
+  проверка — `cosign verify` с явными `--certificate-identity-regexp`
+  (workflow `ci.yml`) и `--certificate-oidc-issuer`.
+- Реализовано в job `docker-smoke` (`.github/workflows/ci.yml`).

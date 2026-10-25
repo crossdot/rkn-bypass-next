@@ -41,24 +41,31 @@ bash deploy/docker/smoke-test.sh
 - **keyless** (не ключ из CI-secrets) — без долгоживущих секретов; проверка
   через OIDC-идентичность GitHub Actions (`id-token: write`).
 
-SBOM-файлы (`server.sbom.json`, `client.sbom.json`) доступны как GitHub
-Actions artifacts. Smoke падает, если подпись невалидна или SBOM пуст.
+SBOM-файлы — `rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.json`
+(имя содержит digest образа) — доступны как GitHub Actions artifacts
+(job `docker-smoke`). Smoke падает, если подпись невалидна или SBOM пуст.
 
 ### Локальная проверка подписи
 
+Подпись keyless, привязана к identity workflow (`ci.yml`) репозитория:
+
 ```bash
 cosign verify \
-  --certificate-identity-regexp "https://github.com/<owner>/<repo>/.*" \
+  --certificate-identity-regexp "^https://github.com/crossdot/rkn-bypass-next/.github/workflows/ci.yml@refs/" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  ghcr.io/<owner>/<repo>/rkn-server:<sha>
+  ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<digest>
 ```
 
-### Генерация SBOM локально
+### Где скачать SBOM
+
+Actions → последний run → job `docker-smoke` → Artifacts → `sbom`
+(`rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.json`).
+
+Локальная генерация (по digest из registry):
 
 ```bash
-syft rkn-server:test -o cyclonedx-json > server.sbom.json
-syft rkn-client:test -o cyclonedx-json > client.sbom.json
+syft ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<digest> -o cyclonedx-json > rkn-server-<digest>.cdx.json
 ```
 
-Связь с ADR-011 п.10: подпись + SBOM — обязательные артефакты релиза;
-производственные образы не публикуются без подписи и SBOM.
+Связь с ADR-011 п.10: подпись + SBOM — обязательные артефакты релиза (не
+опция); производственные образы не публикуются без подписи и SBOM.
