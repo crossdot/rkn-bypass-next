@@ -30,6 +30,7 @@
 - Подпись — `cosign sign` keyless (OIDC GitHub Actions), по digest;
   проверка — `cosign verify` с `--certificate-identity-regexp`,
   заякоренным на `@refs/heads/master$`, и `--certificate-oidc-issuer`.
-- Подпись и push в GHCR выполняются только на push в `master`;
-  PR-сборки образы не публикуют и не подписывают.
+- Подпись/push/SBOM выполняются на push в `master` и на `workflow_dispatch`
+  с `master`; verify заякорен на `@refs/heads/master$` и по digest;
+  PR- и не-master запуски не публикуют и не подписывают.
 - Реализовано в job `docker-smoke` (`.github/workflows/ci.yml`).

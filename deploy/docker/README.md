@@ -47,8 +47,10 @@ SBOM-файлы — `rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.jso
 
 ### Локальная проверка подписи
 
-Образы подписываются **только из `master`**; PR-сборки не публикуются и не
-подписываются. Verify в CI и локально привязан к `refs/heads/master`.
+Образы подписываются **только из `master`**: подпись и публикация выполняются
+на push в `master` и на ручной запуск `workflow_dispatch` с ветки `master`;
+запуск с других веток ничего не пушит и не подписывает. Verify в CI и
+локально привязан к `refs/heads/master`.
 
 ```bash
 cosign verify \
@@ -59,6 +61,10 @@ cosign verify \
 
 ### Где скачать SBOM
 
+SBOM (CycloneDX JSON) публикуется как артефакт **только для master-сборок**
+(push и `workflow_dispatch` с `master`). На `pull_request` SBOM в артефакты
+не выгружается, так как PR-образы не публикуются.
+
 Actions → последний run → job `docker-smoke` → Artifacts → `sbom`
 (`rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.json`).
 
@@ -66,6 +72,15 @@ Actions → последний run → job `docker-smoke` → Artifacts → `sbo
 
 ```bash
 syft ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<digest> -o cyclonedx-json > rkn-server-<digest>.cdx.json
+```
+
+### Ручной перезапуск
+
+Пересобрать и переподписать вручную (с ветки master):
+
+```bash
+gh workflow run ci.yml --ref master
+# или Actions → CI → Run workflow → ветка master
 ```
 
 Связь с ADR-011 п.10: подпись + SBOM — обязательные артефакты релиза (не
