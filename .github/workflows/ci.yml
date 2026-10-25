@@ -35,10 +35,71 @@ jobs:
         run: cargo build
 
   docker-smoke:
-    name: docker build + smoke (ADR-011)
+    name: docker build + smoke + SBOM + sign (ADR-011)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain (for admin-cli)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Build images + smoke test
         run: bash deploy/docker/smoke-test.sh
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM (CycloneDX JSON)
+        run: |
+          syft rkn-server:test -o cyclonedx-json > server.sbom.json
+          syft rkn-client:test -o cyclonedx-json > client.sbom.json
+          test -s server.sbom.json && test -s client.sbom.json
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            server.sbom.json
+            client.sbom.json
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push images to GHCR
+        run: |
+          docker tag rkn-server:test ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
+          docker tag rkn-client:test ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign images (keyless)
+        run: |
+          cosign sign --yes ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
+          cosign sign --yes ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
+
+      - name: Verify signatures
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
