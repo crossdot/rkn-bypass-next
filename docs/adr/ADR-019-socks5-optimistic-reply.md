@@ -1,6 +1,6 @@
 # ADR-019: Оптимистичный SOCKS5 REP_SUCCESS в MVP
 
-## Статус: Superseded by ADR-020 (connect-ack-protocol)
+## Статус: Superseded by ADR-020 (Connect-Ack протокол), реализован в коммите 643b1b5.
 
 ## Контекст
 В MVP клиент отправляет SOCKS5 REP_SUCCESS сразу после установления
