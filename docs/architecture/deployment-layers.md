@@ -22,3 +22,15 @@
   домена или сертификата.
 - Политика выбора транспорта не переключает профиль автоматически.
 - TUN — Phase 2; в MVP его нет.
+
+## Модель исполнения транспорта
+- **MVP (P2/P3):** `Transport` — синхронный трейт (`std::io`-стиль).
+  Реализация TLS — `rustls` (sync, `rustls::StreamOwned` с
+  `std::net::TcpStream`). Сервер и клиент — thread-per-connection.
+- **Phase 2 (после SOCKS5 с конкурентными соединениями):** async-контракт.
+  Реализация — `tokio-rustls` + `tokio::net::TcpStream`. Требует ADR-017.
+- Переход sync → async не требует смены TLS-конфигурации: `rustls`
+  спроектирован как sans-I/O, `ClientConfig`/`ServerConfig` переносятся
+  без изменений.
+- Смена контракта `Transport` (sync → async) — отдельное проектное
+  решение, фиксируется ADR-017 до реализации.

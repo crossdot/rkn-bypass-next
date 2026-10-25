@@ -8,6 +8,7 @@
 - Опциональный режим `entry = "wireguard"` (AmneziaWG, точка входа для других устройств).
 - Профили развёртывания A (Direct) и B (Camouflaged entry).
 - TUN-режим — **Phase 2**, в MVP его нет.
+- Синхронный `Transport` на `rustls` (async — Phase 2, ADR-017).
 
 ## Структура
 - `docs/requirements.md` — требования, целевая среда, режимы клиента, профили
