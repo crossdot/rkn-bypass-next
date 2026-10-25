@@ -41,9 +41,14 @@ bash deploy/docker/smoke-test.sh
 - **keyless** (не ключ из CI-secrets) — без долгоживущих секретов; проверка
   через OIDC-идентичность GitHub Actions (`id-token: write`).
 
-SBOM-файлы — `rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.json`
-(имя содержит digest образа) — доступны как GitHub Actions artifacts
-(job `docker-smoke`). Smoke падает, если подпись невалидна или SBOM пуст.
+SBOM-файлы — `rkn-server-sha256-<hash>.cdx.json`,
+`rkn-client-sha256-<hash>.cdx.json` (имя содержит digest образа, `:` заменён
+на `-`). Доступны как GitHub Actions artifacts (job `docker-smoke`). Smoke
+падает, если подпись невалидна или SBOM пуст.
+
+`upload-artifact@v4` не допускает `:` в именах файлов, поэтому digest в имени
+файла санитизирован (`:` → `-`); digest в `cosign sign`/`verify` остаётся в
+формате `sha256:<hash>`.
 
 ### Локальная проверка подписи
 
@@ -66,12 +71,12 @@ SBOM (CycloneDX JSON) публикуется как артефакт **толь�
 не выгружается, так как PR-образы не публикуются.
 
 Actions → последний run → job `docker-smoke` → Artifacts → `sbom`
-(`rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.json`).
+(`rkn-server-sha256-<hash>.cdx.json`, `rkn-client-sha256-<hash>.cdx.json`).
 
 Локальная генерация (по digest из registry):
 
 ```bash
-syft ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<digest> -o cyclonedx-json > rkn-server-<digest>.cdx.json
+syft ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<hash> -o cyclonedx-json > rkn-server-sha256-<hash>.cdx.json
 ```
 
 ### Ручной перезапуск

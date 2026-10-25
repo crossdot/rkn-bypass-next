@@ -26,7 +26,10 @@
 
 ## Реализация
 - SBOM — `syft` в формате CycloneDX JSON, по digest образа; файлы
-  `rkn-{server,client}-<digest>.cdx.json` — в GitHub Actions artifacts.
+  `rkn-{server,client}-sha256-<hash>.cdx.json` — в GitHub Actions artifacts.
+- SBOM пишется в `workspace/sbom/`; `:` в digest санитизирован для
+  `upload-artifact@v4` (`sha256:<hash>` → `sha256-<hash>` в имени файла);
+  `cosign sign`/`verify` — по `@sha256:<hash>` (с `:`).
 - Подпись — `cosign sign` keyless (OIDC GitHub Actions), по digest;
   проверка — `cosign verify` с `--certificate-identity-regexp`,
   заякоренным на `@refs/heads/master$`, и `--certificate-oidc-issuer`.

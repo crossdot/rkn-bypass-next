@@ -74,8 +74,14 @@ jobs:
           docker push ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
           docker tag rkn-client:test ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
           docker push ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }}
-          echo "SERVER_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }} | cut -d'@' -f2)" >> "$GITHUB_ENV"
-          echo "CLIENT_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }} | cut -d'@' -f2)" >> "$GITHUB_ENV"
+          SERVER_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }} | cut -d'@' -f2)"
+          CLIENT_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ github.repository }}/rkn-client:${{ github.sha }} | cut -d'@' -f2)"
+          echo "SERVER_DIGEST=$SERVER_DIGEST" >> "$GITHUB_ENV"
+          echo "CLIENT_DIGEST=$CLIENT_DIGEST" >> "$GITHUB_ENV"
+          # upload-artifact@v4 не допускает ':' в именах файлов — для имени SBOM
+          # заменяем ':' на '-'. DIGEST (с ':') остаётся для cosign sign/verify.
+          echo "SERVER_DIGEST_SAFE=${SERVER_DIGEST//:/-}" >> "$GITHUB_ENV"
+          echo "CLIENT_DIGEST_SAFE=${CLIENT_DIGEST//:/-}" >> "$GITHUB_ENV"
 
       - name: Install syft
         uses: anchore/sbom-action/download-syft@v0
@@ -83,16 +89,19 @@ jobs:
       - name: Generate SBOM (CycloneDX JSON, named by digest)
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
         run: |
-          syft "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST" -o cyclonedx-json > "rkn-server-$SERVER_DIGEST.cdx.json"
-          syft "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST" -o cyclonedx-json > "rkn-client-$CLIENT_DIGEST.cdx.json"
-          test -s "rkn-server-$SERVER_DIGEST.cdx.json" && test -s "rkn-client-$CLIENT_DIGEST.cdx.json"
+          SBOM_DIR="${{ github.workspace }}/sbom"
+          mkdir -p "$SBOM_DIR"
+          syft "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST" -o "cyclonedx-json=$SBOM_DIR/rkn-server-$SERVER_DIGEST_SAFE.cdx.json"
+          syft "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST" -o "cyclonedx-json=$SBOM_DIR/rkn-client-$CLIENT_DIGEST_SAFE.cdx.json"
+          test -s "$SBOM_DIR/rkn-server-$SERVER_DIGEST_SAFE.cdx.json" && test -s "$SBOM_DIR/rkn-client-$CLIENT_DIGEST_SAFE.cdx.json"
 
       - name: Upload SBOM artifacts
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: sbom
-          path: '*.cdx.json'
+          path: ${{ github.workspace }}/sbom/*.cdx.json
+          if-no-files-found: error
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
