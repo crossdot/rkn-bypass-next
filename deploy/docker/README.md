@@ -47,11 +47,12 @@ SBOM-файлы — `rkn-server-<digest>.cdx.json`, `rkn-client-<digest>.cdx.jso
 
 ### Локальная проверка подписи
 
-Подпись keyless, привязана к identity workflow (`ci.yml`) репозитория:
+Образы подписываются **только из `master`**; PR-сборки не публикуются и не
+подписываются. Verify в CI и локально привязан к `refs/heads/master`.
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp "^https://github.com/crossdot/rkn-bypass-next/.github/workflows/ci.yml@refs/" \
+  --certificate-identity-regexp "^https://github.com/crossdot/rkn-bypass-next/.github/workflows/ci.yml@refs/heads/master$" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   ghcr.io/crossdot/rkn-bypass-next/rkn-server@sha256:<digest>
 ```

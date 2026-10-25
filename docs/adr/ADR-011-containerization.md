@@ -28,6 +28,8 @@
 - SBOM — `syft` в формате CycloneDX JSON, по digest образа; файлы
   `rkn-{server,client}-<digest>.cdx.json` — в GitHub Actions artifacts.
 - Подпись — `cosign sign` keyless (OIDC GitHub Actions), по digest;
-  проверка — `cosign verify` с явными `--certificate-identity-regexp`
-  (workflow `ci.yml`) и `--certificate-oidc-issuer`.
+  проверка — `cosign verify` с `--certificate-identity-regexp`,
+  заякоренным на `@refs/heads/master$`, и `--certificate-oidc-issuer`.
+- Подпись и push в GHCR выполняются только на push в `master`;
+  PR-сборки образы не публикуют и не подписывают.
 - Реализовано в job `docker-smoke` (`.github/workflows/ci.yml`).

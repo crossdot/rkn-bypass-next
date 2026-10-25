@@ -55,6 +55,7 @@ jobs:
         run: bash deploy/docker/smoke-test.sh
 
       - name: Login to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -62,6 +63,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push images to GHCR (capture digests)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           docker tag rkn-server:test ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
           docker push ghcr.io/${{ github.repository }}/rkn-server:${{ github.sha }}
@@ -74,12 +76,14 @@ jobs:
         uses: anchore/sbom-action/download-syft@v0
 
       - name: Generate SBOM (CycloneDX JSON, named by digest)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           syft "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST" -o cyclonedx-json > "rkn-server-$SERVER_DIGEST.cdx.json"
           syft "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST" -o cyclonedx-json > "rkn-client-$CLIENT_DIGEST.cdx.json"
           test -s "rkn-server-$SERVER_DIGEST.cdx.json" && test -s "rkn-client-$CLIENT_DIGEST.cdx.json"
 
       - name: Upload SBOM artifacts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v4
         with:
           name: sbom
@@ -89,17 +93,26 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Sign images (keyless, by digest)
+        id: sign
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           cosign sign --yes "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST"
           cosign sign --yes "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST"
 
+      # verify выполняется только после фактически успешной подписи.
+      # Выбран `steps.sign.outcome == 'success'`, а не то же условие
+      # (push && master): привязка к факту подписи, а не к ветке. На PR шаг
+      # sign пропущен (outcome = skipped) → verify тоже пропущен и не падает
+      # из-за отсутствия подписи; на master verify идёт только после успешного
+      # sign (если sign упал — джоба уже остановлена).
       - name: Verify signatures
+        if: steps.sign.outcome == 'success'
         run: |
-          cosign verify \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST"
-          cosign verify \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST"
+          for ref in \
+            "ghcr.io/${{ github.repository }}/rkn-server@$SERVER_DIGEST" \
+            "ghcr.io/${{ github.repository }}/rkn-client@$CLIENT_DIGEST"; do
+            cosign verify \
+              --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/master$" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$ref"
+          done
