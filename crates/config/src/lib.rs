@@ -31,6 +31,10 @@ impl fmt::Display for ConfigError {
     }
 }
 
+// Намеренно без source(): не пробрасываем toml::de::Error наружу,
+// чтобы содержимое конфига (включая inline PEM) не попадало в логи.
+// При апгрейде toml (0.5 → 0.7+) перепроверить, что Display не
+// содержит raw config. См. ADR-021 «Логи и секреты».
 impl std::error::Error for ConfigError {}
 
 /// Ошибка адресного правила.
@@ -276,6 +280,32 @@ impl ClientRegistry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Количество авторизованных (не отозванных) клиентов.
+    pub fn authorized_len(&self) -> usize {
+        self.entries.iter().filter(|e| !e.revoked).count()
+    }
+
+    /// SHA-256 канонического представления авторизованных fingerprints
+    /// (лексикографически отсортированных) — для проверки идентичности
+    /// конфига на нескольких серверах. См. ADR-021 «Отзыв и ротация».
+    pub fn config_hash(&self) -> String {
+        let mut fps: Vec<&str> = self
+            .entries
+            .iter()
+            .filter(|e| !e.revoked)
+            .map(|e| e.fingerprint.as_str())
+            .collect();
+        fps.sort_unstable();
+        let json = format!(
+            r#"{{"fingerprints":[{}]}}"#,
+            fps.iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        crypto::fingerprint(json.as_bytes())
+    }
 }
 
 /// Загружает DER-сертификат из `key_material` (путь к файлу или inline PEM).
@@ -484,5 +514,50 @@ mod tests {
         // allow_ports_low не задан — по умолчанию [80, 443].
         assert_eq!(rules.check(ip4(8, 8, 8, 8), 80), Ok(()));
         assert_eq!(rules.check(ip4(8, 8, 8, 8), 443), Ok(()));
+    }
+
+    #[test]
+    fn config_hash_canonical_and_revocation_sensitive() {
+        let (ca_cert, ca_key) = crypto::generate_ca().unwrap();
+        let a = crypto::generate_client_cert("a", &ca_cert, &ca_key).unwrap();
+        let b = crypto::generate_client_cert("b", &ca_cert, &ca_key).unwrap();
+        let c = crypto::generate_client_cert("c", &ca_cert, &ca_key).unwrap();
+
+        let ab = ClientRegistry::from_toml(&format!(
+            "[[server.clients]]\nclient_id = \"a\"\nkey_material = '''{}'''\n\
+             [[server.clients]]\nclient_id = \"b\"\nkey_material = '''{}'''\n",
+            a.cert_pem, b.cert_pem
+        ))
+        .unwrap();
+        let ba = ClientRegistry::from_toml(&format!(
+            "[[server.clients]]\nclient_id = \"b\"\nkey_material = '''{}'''\n\
+             [[server.clients]]\nclient_id = \"a\"\nkey_material = '''{}'''\n",
+            b.cert_pem, a.cert_pem
+        ))
+        .unwrap();
+
+        // Порядок fingerprints в конфиге не влияет на хеш (canonical).
+        assert_eq!(ab.config_hash(), ba.config_hash());
+        assert_eq!(ab.authorized_len(), 2);
+
+        // Третий fingerprint меняет хеш.
+        let abc = ClientRegistry::from_toml(&format!(
+            "[[server.clients]]\nclient_id = \"a\"\nkey_material = '''{}'''\n\
+             [[server.clients]]\nclient_id = \"b\"\nkey_material = '''{}'''\n\
+             [[server.clients]]\nclient_id = \"c\"\nkey_material = '''{}'''\n",
+            a.cert_pem, b.cert_pem, c.cert_pem
+        ))
+        .unwrap();
+        assert_ne!(ab.config_hash(), abc.config_hash());
+
+        // Отзыв клиента меняет хеш (отозванный исключается из набора).
+        let a_revoked = ClientRegistry::from_toml(&format!(
+            "[[server.clients]]\nclient_id = \"a\"\nkey_material = '''{}'''\nrevoked = true\n\
+             [[server.clients]]\nclient_id = \"b\"\nkey_material = '''{}'''\n",
+            a.cert_pem, b.cert_pem
+        ))
+        .unwrap();
+        assert_ne!(ab.config_hash(), a_revoked.config_hash());
+        assert_eq!(a_revoked.authorized_len(), 1);
     }
 }

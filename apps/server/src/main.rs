@@ -91,6 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rules = load_address_rules();
     let registry = Arc::new(load_client_registry());
+    println!(
+        "config loaded: fingerprint_count={} config_hash={}",
+        registry.authorized_len(),
+        registry.config_hash()
+    );
 
     // mTLS: доверяем CA (dev-ca) для клиентских сертификатов.
     let mut client_roots = RootCertStore::empty();
