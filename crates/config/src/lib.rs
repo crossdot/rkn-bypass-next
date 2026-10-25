@@ -62,14 +62,28 @@ struct RawServer {
     address_rules: RawAddressRules,
 }
 
-#[derive(Deserialize, Default)]
+fn default_allow_ports_low() -> Vec<u16> {
+    vec![80, 443]
+}
+
+#[derive(Deserialize)]
 struct RawAddressRules {
-    #[serde(default)]
+    #[serde(default = "default_allow_ports_low")]
     allow_ports_low: Vec<u16>,
     #[serde(default)]
     allow_cidrs: Vec<String>,
     #[serde(default)]
     deny_cidrs: Vec<String>,
+}
+
+impl Default for RawAddressRules {
+    fn default() -> Self {
+        Self {
+            allow_ports_low: default_allow_ports_low(),
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+        }
+    }
 }
 
 /// Правила допустимых адресов назначения.
@@ -81,14 +95,24 @@ struct RawAddressRules {
 /// 3. RFC1918 private (10/8, 172.16/12, 192.168/16) — default-deny,
 ///    переопределяется `allow_cidrs`;
 /// 4. порт < 1024 — deny, кроме `allow_ports_low`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressRules {
-    /// Низкие порты (<1024), разрешённые явно.
+    /// Низкие порты (<1024), разрешённые явно (по умолчанию 80, 443).
     pub allow_ports_low: Vec<u16>,
     /// Разрешённые CIDR (переопределяют default-deny приватных диапазонов).
     pub allow_cidrs: Vec<IpNet>,
     /// Запрещённые CIDR (переопределяют allow_cidrs).
     pub deny_cidrs: Vec<IpNet>,
+}
+
+impl Default for AddressRules {
+    fn default() -> Self {
+        Self {
+            allow_ports_low: default_allow_ports_low(),
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+        }
+    }
 }
 
 impl AddressRules {
@@ -292,5 +316,26 @@ mod tests {
     fn public_high_port_allowed() {
         let rules = AddressRules::default();
         assert_eq!(rules.check(ip4(8, 8, 8, 8), 8443), Ok(()));
+    }
+
+    #[test]
+    fn default_allows_http_https() {
+        let rules = AddressRules::default();
+        assert_eq!(rules.check(ip4(8, 8, 8, 8), 80), Ok(()));
+        assert_eq!(rules.check(ip4(8, 8, 8, 8), 443), Ok(()));
+    }
+
+    #[test]
+    fn partial_toml_keeps_http_https_defaults() {
+        let rules = AddressRules::from_toml(
+            r#"
+            [server.address_rules]
+            deny_cidrs = ["10.0.0.0/8"]
+            "#,
+        )
+        .unwrap();
+        // allow_ports_low не задан — по умолчанию [80, 443].
+        assert_eq!(rules.check(ip4(8, 8, 8, 8), 80), Ok(()));
+        assert_eq!(rules.check(ip4(8, 8, 8, 8), 443), Ok(()));
     }
 }
