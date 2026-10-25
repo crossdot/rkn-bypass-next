@@ -3,12 +3,18 @@ resolver = "2"
 members = [
     "crates/core-types",
     "crates/config",
+    "crates/protocol",
     "crates/transport-api",
+    "crates/transport-tls",
+    "apps/client",
+    "apps/server",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.85"
 
 [workspace.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"

@@ -1,0 +1,15 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+protocol = { path = "../../crates/protocol" }
+transport-tls = { path = "../../crates/transport-tls" }
