@@ -24,6 +24,8 @@ pub const AUTH_NO_ACCEPTABLE: u8 = 0xFF;
 pub const REP_SUCCESS: u8 = 0x00;
 /// Код ответа: общий сбой.
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+/// Код ответа: соединение не разрешено набором правил.
+pub const REP_CONNECTION_NOT_ALLOWED: u8 = 0x02;
 /// Код ответа: сеть недоступна.
 pub const REP_NETWORK_UNREACHABLE: u8 = 0x03;
 /// Код ответа: узел недоступен.

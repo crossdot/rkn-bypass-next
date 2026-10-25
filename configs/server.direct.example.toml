@@ -7,3 +7,11 @@ addr = "0.0.0.0:443"
 [tls]
 cert = "/etc/netcore/cert.pem"
 key = "/etc/netcore/key.pem"
+
+[server.address_rules]
+# Порты ниже 1024, разрешённые явно.
+allow_ports_low = [80, 443]
+# CIDR, разрешённые явно (переопределяют default-deny приватных диапазонов).
+allow_cidrs = []
+# CIDR, запрещённые явно (переопределяют allow_cidrs).
+deny_cidrs = []

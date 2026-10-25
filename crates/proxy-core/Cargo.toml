@@ -7,11 +7,13 @@ rust-version.workspace = true
 [dependencies]
 socks5 = { path = "../socks5" }
 protocol = { path = "../protocol" }
+config = { path = "../config" }
 transport-tls = { path = "../transport-tls" }
 
 [dev-dependencies]
 transport-tls = { path = "../transport-tls" }
 socks5 = { path = "../socks5" }
 protocol = { path = "../protocol" }
+config = { path = "../config" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

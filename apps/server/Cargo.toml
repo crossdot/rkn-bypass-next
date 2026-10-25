@@ -11,5 +11,6 @@ path = "src/main.rs"
 [dependencies]
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+config = { path = "../../crates/config" }
 transport-tls = { path = "../../crates/transport-tls" }
 proxy-core = { path = "../../crates/proxy-core" }

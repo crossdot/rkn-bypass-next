@@ -1,5 +1,5 @@
 //! TLS-сервер: принимает логические потоки от клиента и открывает
-//! TCP к запрошенному адресу.
+//! TCP к запрошенному адресу (с проверкой адресных правил).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -14,7 +14,7 @@ use transport_tls::{ensure_crypto_provider, ServerTransport};
 
 const LISTEN_ADDR: &str = "127.0.0.1:8443";
 
-fn load_server_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
+fn load_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
     let cert_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.crt");
     let ca_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt");
     let key_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.key");
@@ -38,21 +38,45 @@ fn load_server_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>>
     ))
 }
 
+/// Загружает адресные правила из TOML (`argv[1]`), иначе — безопасный default.
+fn load_address_rules() -> config::AddressRules {
+    let Some(path) = std::env::args().nth(1) else {
+        return config::AddressRules::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(toml) => match config::AddressRules::from_toml(&toml) {
+            Ok(rules) => rules,
+            Err(e) => {
+                eprintln!("warning: bad config {path}: {e}; using default rules");
+                config::AddressRules::default()
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: cannot read {path}: {e}; using default rules");
+            config::AddressRules::default()
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
-    let config = load_server_config()?;
+    let tls_config = load_tls_config()?;
+    let rules = load_address_rules();
     let listener = TcpListener::bind(LISTEN_ADDR)?;
     println!("TLS server listening on {LISTEN_ADDR}");
 
     for stream in listener.incoming() {
         let sock = stream?;
-        let config = Arc::clone(&config);
+        let tls_config = Arc::clone(&tls_config);
+        let rules = rules.clone();
         thread::spawn(move || {
-            match ServerTransport::accept(sock, config, Duration::from_secs(10)) {
+            match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)) {
                 Ok(server) => {
-                    if let Err(e) =
-                        proxy_core::serve_server_connection(server, proxy_core::CONNECT_TIMEOUT)
-                    {
+                    if let Err(e) = proxy_core::serve_server_connection(
+                        server,
+                        proxy_core::CONNECT_TIMEOUT,
+                        &rules,
+                    ) {
                         eprintln!("connection error: {e}");
                     }
                 }

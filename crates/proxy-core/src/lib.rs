@@ -9,7 +9,7 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use transport_tls::{ClientTransport, ServerTransport, Transport};
@@ -206,32 +206,32 @@ fn map_connect_error(e: &io::Error) -> u8 {
     }
 }
 
-/// Устанавливает TCP-соединение к цели с таймаутом.
-fn connect_target(target: &socks5::Target, timeout: Duration) -> io::Result<TcpStream> {
+/// Разрешает цель в список IP-адресов (для домена — все адреса из DNS).
+fn resolve_target_ips(target: &socks5::Target) -> Result<Vec<IpAddr>, ProxyError> {
     match &target.addr {
-        socks5::Addr::IPv4(b) => TcpStream::connect_timeout(
-            &SocketAddr::from((Ipv4Addr::from(*b), target.port)),
-            timeout,
-        ),
-        socks5::Addr::IPv6(b) => TcpStream::connect_timeout(
-            &SocketAddr::from((Ipv6Addr::from(*b), target.port)),
-            timeout,
-        ),
+        socks5::Addr::IPv4(b) => Ok(vec![IpAddr::V4(Ipv4Addr::from(*b))]),
+        socks5::Addr::IPv6(b) => Ok(vec![IpAddr::V6(Ipv6Addr::from(*b))]),
         socks5::Addr::Domain(d) => {
             let host = String::from_utf8_lossy(d).into_owned();
-            let addrs: Vec<SocketAddr> = (host.as_str(), target.port).to_socket_addrs()?.collect();
-            let mut last_err = None;
-            for addr in addrs {
-                match TcpStream::connect_timeout(&addr, timeout) {
-                    Ok(sock) => return Ok(sock),
-                    Err(e) => last_err = Some(e),
-                }
+            let ips = (host.as_str(), 0)
+                .to_socket_addrs()
+                .map_err(ProxyError::Io)?
+                .map(|a| a.ip())
+                .collect::<Vec<_>>();
+            if ips.is_empty() {
+                return Err(ProxyError::Io(io::Error::new(
+                    io::ErrorKind::HostUnreachable,
+                    "no address resolved",
+                )));
             }
-            Err(last_err.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::HostUnreachable, "no address resolved")
-            }))
+            Ok(ips)
         }
     }
+}
+
+/// Подключается к `ip:port` с таймаутом.
+fn connect_ip(ip: IpAddr, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout)
 }
 
 /// Обрабатывает одно соединение на стороне клиента (SOCKS5 → TLS).
@@ -308,13 +308,37 @@ pub fn serve_client_connection(
 pub fn serve_server_connection(
     mut server: ServerTransport,
     connect_timeout: Duration,
+    rules: &config::AddressRules,
 ) -> Result<(), ProxyError> {
     let target = read_connect_target(&mut server)?;
+    let ips = resolve_target_ips(&target)?;
 
-    let tcp = match connect_target(&target, connect_timeout) {
-        Ok(tcp) => tcp,
-        Err(e) => {
-            let rep = map_connect_error(&e);
+    // Проверка адресных правил (SSRF) до подключения.
+    for ip in &ips {
+        if rules.check(*ip, target.port).is_err() {
+            let _ = write_connect_ack(&mut server, socks5::REP_CONNECTION_NOT_ALLOWED);
+            return Ok(());
+        }
+    }
+
+    let mut tcp = None;
+    let mut last_err = None;
+    for ip in &ips {
+        match connect_ip(*ip, target.port, connect_timeout) {
+            Ok(sock) => {
+                tcp = Some(sock);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let tcp = match tcp {
+        Some(sock) => sock,
+        None => {
+            let rep = last_err
+                .as_ref()
+                .map(map_connect_error)
+                .unwrap_or(socks5::REP_GENERAL_FAILURE);
             let _ = write_connect_ack(&mut server, rep);
             return Ok(());
         }

@@ -1,31 +1,42 @@
 # Ограничения SOCKS5-режима (MVP)
 
 ## Известные ограничения
-- **Ограничения по адресам на сервере.** Сервер пока открывает TCP
-  к любому запрошенному адресу. Ограничения — следующий шаг.
 - **Нет UDP ASSOCIATE и BIND.** Обе команды отклоняются с `0x07`
   (Command not supported). Это осознанно для MVP.
 - **Thread-per-connection.** Масштабируется ограниченно; async —
   Phase 2 (ADR-017).
+- **DNS-rebinding (TOCTOU).** Для доменных целей адресные правила
+  проверяются по всем разрешённым IP, но подключение идёт к первому IP;
+  гонка между проверкой и connect не устранена (MVP).
 
-## Реализовано: ack-протокол (P3-fix)
-- Формат, маппинг ошибок и таймауты зафиксированы в ADR-020.
+## Реализовано
+
+### ack-протокол (P3-fix)
 - Сервер после `TcpStream::connect` к цели отправляет `ConnectAck`
   (payload = 1 байт REP-кода). Клиент ждёт ack с таймаутом
   (`ACK_TIMEOUT`) и только затем отправляет `REP_SUCCESS`.
-- Ошибки connect маппятся в REP-коды: `ConnectionRefused → 0x05`,
+- Ошибки connect → REP-коды: `ConnectionRefused → 0x05`,
   `NetworkUnreachable → 0x03`, `HostUnreachable/TimedOut → 0x04`,
   прочее → `0x01`. Таймаут ack → `0x04`.
 
-## Что проверено
-- `curl -4 --socks5 127.0.0.1:1080 http://example.com` → HTTP 200.
-- `curl --socks5-hostname 127.0.0.1:1080 http://example.com` → HTTP 200.
-- 30 автоматических тестов: relay mid-transfer, 8 конкурентных CONNECT,
-  отказ UDP/BIND, connection-refused (0x05), ack-timeout (0x04),
-  битый ConnectAck (0x01), IPv6-loopback (::1).
+### Адресные правила (P7.3)
+- `[server.address_rules]` в TOML: `allow_ports_low`, `allow_cidrs`,
+  `deny_cidrs`. Парсинг + валидация CIDR в `crates/config`.
+- Hardcoded always-deny (не переопределяется): loopback, link-local,
+  unspecified, multicast, ULA — `127/8`, `::1`, `169.254/16`, `0/8`,
+  `224/4`, `fc00::/7`, `fe80::/10`.
+- RFC1918 (`10/8`, `172.16/12`, `192.168/16`) — default-deny,
+  переопределяется `allow_cidrs`.
+- Порт < 1024 — deny, кроме `allow_ports_low`.
+- `deny_cidrs` переопределяет `allow_cidrs`.
+- При отказе — `ConnectAck` с `REP_CONNECTION_NOT_ALLOWED` (0x02).
 
-## Что не проверено в этой среде
-- Точная команда `curl --socks5 127.0.0.1:1080 http://example.com`
-  без флагов: в песочнице нет IPv6-маршрута, резолвер отдаёт IPv6,
-  сервер получает `ENETUNREACH`. Это не баг relay; проверено
-  прямым `TcpStream::connect` и IPv6-литералом.
+### Диагностика (P9)
+- `apps/diag-cli` — `diag check <host>:<port>`: connect → TLS →
+  SOCKS5-ack → relay, класс ошибки на каждом этапе, без root.
+
+## Что проверено
+- `curl --socks5 127.0.0.1:1080 http://127.0.0.1/` → 0x02 (not allowed).
+- 44 автоматических теста: relay, конкурентные CONNECT, отказ UDP/BIND,
+  ack-протокол (0x05/0x04/0x01), адресные правила (loopback/link-local/
+  low-port/private, allow/deny CIDR).

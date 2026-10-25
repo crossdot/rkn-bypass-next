@@ -1,0 +1,16 @@
+[package]
+name = "diag-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "diag-cli"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+transport-tls = { path = "../../crates/transport-tls" }
+proxy-core = { path = "../../crates/proxy-core" }
+socks5 = { path = "../../crates/socks5" }

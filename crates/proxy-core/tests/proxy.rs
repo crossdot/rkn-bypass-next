@@ -1,8 +1,8 @@
-//! Интеграционные тесты SOCKS5-режима.
+//! Интеграционные тесты SOCKS5-режима и адресных правил.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -59,12 +59,31 @@ fn socket_pair() -> (TcpStream, TcpStream) {
     (a, b)
 }
 
-/// Закрытый (не слушающий) порт на 127.0.0.1.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// Закрытый (не слушающий) порт на заданном IP.
+fn closed_port_on(ip: IpAddr) -> u16 {
+    let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+/// IPv4-адрес хоста (для недостижимой по loopback цели в тестах).
+fn host_ipv4() -> Ipv4Addr {
+    let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
+    sock.connect("8.8.8.8:80").unwrap();
+    match sock.local_addr().unwrap().ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => panic!("no IPv4 address"),
+    }
+}
+
+/// Permissive-правила: разрешают весь IPv4 (кроме hardcoded-deny).
+fn permissive_rules() -> config::AddressRules {
+    config::AddressRules::from_toml(
+        r#"[server.address_rules]
+        allow_cidrs = ["0.0.0.0/0"]"#,
+    )
+    .unwrap()
 }
 
 fn target_from_socket(addr: SocketAddr) -> socks5::Target {
@@ -107,17 +126,23 @@ fn spawn_echo_target_on(bind: &str, n: usize) -> SocketAddr {
     addr
 }
 
-/// TLS-сервер, принимающий ровно `n` соединений и релеющий их в цель.
-fn spawn_tls_server(config: Arc<ServerConfig>, n: usize) -> SocketAddr {
+/// TLS-сервер, принимающий ровно `n` соединений и релеющий их в цель
+/// с заданными адресными правилами.
+fn spawn_tls_server(
+    config: Arc<ServerConfig>,
+    n: usize,
+    rules: config::AddressRules,
+) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
         for _ in 0..n {
             let (sock, _) = listener.accept().unwrap();
             let config = Arc::clone(&config);
+            let rules = rules.clone();
             thread::spawn(move || {
                 let server = ServerTransport::accept(sock, config, Duration::from_secs(5)).unwrap();
-                let _ = proxy_core::serve_server_connection(server, Duration::from_secs(5));
+                let _ = proxy_core::serve_server_connection(server, Duration::from_secs(3), &rules);
             });
         }
     });
@@ -159,18 +184,15 @@ fn run_connect(
         proxy_core::serve_client_connection(proxy_side, client, ack_timeout)
     });
 
-    // SOCKS5 greeting: version 5, 1 method, no-auth.
     app.write_all(&[0x05, 0x01, 0x00]).unwrap();
     let mut sel = [0u8; 2];
     app.read_exact(&mut sel).unwrap();
     assert_eq!(sel, [0x05, 0x00]);
 
-    // CONNECT-запрос к цели.
     let mut req = vec![0x05, 0x01, 0x00];
     req.extend_from_slice(&target_from_socket(target_addr).encode());
     app.write_all(&req).unwrap();
 
-    // Ответ: VER REP RSV ATYP BND.ADDR BND.PORT (10 байт).
     let mut reply = [0u8; 10];
     app.read_exact(&mut reply).unwrap();
     assert_eq!(reply[0], 0x05);
@@ -284,9 +306,9 @@ fn relay_mid_transfer_drop() {
 #[test]
 fn end_to_end_connect_echo() {
     ensure_crypto_provider();
-    let target_addr = spawn_echo_target_on("127.0.0.1:0", 1);
-    let server_cfg = load_server_config();
-    let server_addr = spawn_tls_server(server_cfg, 1);
+    let host = host_ipv4();
+    let target_addr = spawn_echo_target_on(&format!("{host}:0"), 1);
+    let server_addr = spawn_tls_server(load_server_config(), 1, permissive_rules());
 
     let (rep, echoed) = run_connect(server_addr, target_addr, Duration::from_secs(5), b"hello");
     assert_eq!(rep, 0x00);
@@ -297,9 +319,9 @@ fn end_to_end_connect_echo() {
 fn concurrent_connects() {
     ensure_crypto_provider();
     let n = 8;
-    let target_addr = spawn_echo_target_on("127.0.0.1:0", n);
-    let server_cfg = load_server_config();
-    let server_addr = spawn_tls_server(server_cfg, n);
+    let host = host_ipv4();
+    let target_addr = spawn_echo_target_on(&format!("{host}:0"), n);
+    let server_addr = spawn_tls_server(load_server_config(), n, permissive_rules());
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
@@ -320,9 +342,10 @@ fn concurrent_connects() {
 #[test]
 fn connect_refused_reports_rep() {
     ensure_crypto_provider();
-    let target = SocketAddr::from(([127, 0, 0, 1], closed_port()));
-    let server_cfg = load_server_config();
-    let server_addr = spawn_tls_server(server_cfg, 1);
+    let host = host_ipv4();
+    let port = closed_port_on(IpAddr::V4(host));
+    let target = SocketAddr::from((host, port));
+    let server_addr = spawn_tls_server(load_server_config(), 1, permissive_rules());
 
     let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
     assert_eq!(rep, 0x05); // connection refused
@@ -331,7 +354,6 @@ fn connect_refused_reports_rep() {
 #[test]
 fn connect_ack_timeout_reports_rep() {
     ensure_crypto_provider();
-    // Сервер читает цель, но не отвечает ack — клиент должен выйти по таймауту.
     let server_addr = spawn_fake_server(|mut server| {
         let _ = proxy_core::read_connect_target(&mut server);
         thread::sleep(Duration::from_secs(5));
@@ -345,7 +367,6 @@ fn connect_ack_timeout_reports_rep() {
 #[test]
 fn bad_connect_ack_reports_failure() {
     ensure_crypto_provider();
-    // Сервер отправляет битый ConnectAck (payload 2 байта вместо 1).
     let server_addr = spawn_fake_server(|mut server| {
         let _ = proxy_core::read_connect_target(&mut server);
         protocol::write_message(
@@ -361,19 +382,67 @@ fn bad_connect_ack_reports_failure() {
 }
 
 #[test]
-fn ipv6_loopback() {
+fn blocked_loopback_rep() {
     ensure_crypto_provider();
-    // Явный скип, если IPv6 loopback недоступен.
-    if TcpListener::bind("[::1]:0").is_err() {
-        eprintln!("IPv6 loopback not supported; skipping ipv6_loopback");
-        return;
-    }
+    let server_addr = spawn_tls_server(load_server_config(), 1, config::AddressRules::default());
+    let target = SocketAddr::from(([127, 0, 0, 1], 80));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x02); // not allowed
+}
 
-    let target_addr = spawn_echo_target_on("[::1]:0", 1);
-    let server_cfg = load_server_config();
-    let server_addr = spawn_tls_server(server_cfg, 1);
+#[test]
+fn blocked_ipv6_loopback_rep() {
+    ensure_crypto_provider();
+    let server_addr = spawn_tls_server(load_server_config(), 1, config::AddressRules::default());
+    let target = SocketAddr::from((Ipv6Addr::LOCALHOST, 80));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x02);
+}
 
-    let (rep, echoed) = run_connect(server_addr, target_addr, Duration::from_secs(5), b"hello");
-    assert_eq!(rep, 0x00);
-    assert_eq!(echoed, b"hello");
+#[test]
+fn blocked_link_local_rep() {
+    ensure_crypto_provider();
+    let server_addr = spawn_tls_server(load_server_config(), 1, config::AddressRules::default());
+    let target = SocketAddr::from(([169, 254, 1, 1], 8080));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x02);
+}
+
+#[test]
+fn blocked_low_port_rep() {
+    ensure_crypto_provider();
+    let server_addr = spawn_tls_server(load_server_config(), 1, config::AddressRules::default());
+    // Публичный IP, порт 22 — отклонён правилом низких портов.
+    let target = SocketAddr::from(([8, 8, 8, 8], 22));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x02);
+}
+
+#[test]
+fn allowed_private_cidr_not_blocked() {
+    ensure_crypto_provider();
+    let rules = config::AddressRules::from_toml(
+        r#"[server.address_rules]
+        allow_cidrs = ["192.168.1.0/24"]"#,
+    )
+    .unwrap();
+    let server_addr = spawn_tls_server(load_server_config(), 1, rules);
+    let target = SocketAddr::from(([192, 168, 1, 1], 8080));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_ne!(rep, 0x02); // адрес разрешён (не «not allowed»)
+}
+
+#[test]
+fn deny_cidr_overrides_allow() {
+    ensure_crypto_provider();
+    let rules = config::AddressRules::from_toml(
+        r#"[server.address_rules]
+        allow_cidrs = ["192.168.1.0/24"]
+        deny_cidrs = ["192.168.1.0/24"]"#,
+    )
+    .unwrap();
+    let server_addr = spawn_tls_server(load_server_config(), 1, rules);
+    let target = SocketAddr::from(([192, 168, 1, 1], 8080));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x02); // deny выигрывает
 }
