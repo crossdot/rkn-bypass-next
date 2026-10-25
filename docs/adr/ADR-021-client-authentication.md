@@ -113,3 +113,6 @@
 - Отзыв гарантирован только для full handshake; аудит покрывает только
   full handshake.
 - «Безопасный resumption» (с повторной проверкой отзыва) — будущий ADR, не MVP.
+- Принцип зафиксирован в AGENTS.md: обход verify_client_cert любым
+  механизмом (resumption, PSK, 0-RTT) — изменение security-свойств,
+  требует явного ADR.
