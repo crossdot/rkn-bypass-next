@@ -1,8 +1,8 @@
 //! SOCKS5-клиент: принимает CONNECT от приложений и проксирует их
-//! через TLS к серверу.
+//! через TLS (с mTLS) к серверу.
 //!
-//! Конфигурация через переменные окружения (с дефолтами для нативной
-//! разработки): `LISTEN_ADDR`, `SERVER_ADDR`, `CA_PATH`.
+//! Конфигурация через env: `LISTEN_ADDR`, `SERVER_ADDR`, `CA_PATH`,
+//! `CLIENT_CERT`, `CLIENT_KEY`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use transport_tls::{ensure_crypto_provider, ClientTransport};
 
@@ -18,15 +19,27 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-fn load_client_config(ca_path: &str) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
+fn load_client_config(
+    ca_path: &str,
+    client_cert_path: &str,
+    client_key_path: &str,
+) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(ca_path)?)) {
         roots.add(cert?)?;
     }
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(File::open(client_cert_path)?))
+            .collect::<Result<_, _>>()?;
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(File::open(client_key_path)?))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "client key not found")
+            })?;
     Ok(Arc::new(
         ClientConfig::builder()
             .with_root_certificates(roots)
-            .with_no_client_auth(),
+            .with_client_auth_cert(certs, key)?,
     ))
 }
 
@@ -44,8 +57,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "CA_PATH",
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt"),
     );
+    let client_cert = env_or("CLIENT_CERT", "");
+    let client_key = env_or("CLIENT_KEY", "");
+    if client_cert.is_empty() || client_key.is_empty() {
+        return Err("CLIENT_CERT and CLIENT_KEY must be set".into());
+    }
 
-    let config = load_client_config(&ca_path)?;
+    let config = load_client_config(&ca_path, &client_cert, &client_key)?;
     let listener = TcpListener::bind(&listen_addr)?;
     println!("SOCKS5 listening on {listen_addr} (server {server_addr})");
 

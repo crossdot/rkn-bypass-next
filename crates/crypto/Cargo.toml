@@ -1,0 +1,12 @@
+[package]
+name = "crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rcgen = { version = "0.13", features = ["x509-parser"] }
+zeroize = "1"
+ring = "0.17"
+# Пин транзитивной зависимости rcgen; time >=0.3.55 требует rustc 1.88 (MSRV 1.85).
+time = "=0.3.36"

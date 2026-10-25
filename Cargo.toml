@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core-types",
     "crates/config",
+    "crates/crypto",
     "crates/protocol",
     "crates/socks5",
     "crates/transport-api",
@@ -11,6 +12,7 @@ members = [
     "apps/client",
     "apps/server",
     "apps/diag-cli",
+    "apps/admin-cli",
 ]
 
 [workspace.package]

@@ -191,6 +191,15 @@ impl ServerTransport {
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         self.stream.sock.set_read_timeout(timeout)
     }
+
+    /// DER-сертификат клиента (после handshake), если предъявлен.
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        self.stream
+            .conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|c| c.as_ref().to_vec())
+    }
 }
 
 impl Transport for ServerTransport {

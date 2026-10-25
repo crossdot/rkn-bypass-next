@@ -11,15 +11,17 @@
 - Синхронный `Transport` на `rustls` (async — Phase 2, ADR-017).
 - Адресные правила на сервере (`[server.address_rules]`).
 - `diag check` для диагностики этапов соединения.
-- **Не входит:** клиентская аутентификация (ADR-021, следующий спринт),
-  Docker-образы (операционный долг), TUN (Phase 2), второй транспорт.
+- Клиентская аутентификация — mTLS per-client (ADR-021), `apps/admin-cli`
+  (`add`/`revoke`/`rotate-key`/`list`).
+- Docker-образы и smoke-тест (ADR-011) в `deploy/docker/`.
+- **Не входит:** TUN (Phase 2), второй транспорт.
 
 ## Структура
 - `docs/requirements.md` — требования, целевая среда, режимы клиента, профили
 - `docs/security/threat-model.md` — РФ-специфичные угрозы
 - `docs/architecture/deployment-layers.md` — границы слоёв
 - `docs/development/optional-profiles.md` — таблица осей и опциональных профилей
-- `docs/adr/` — ADR-011 … ADR-016
+- `docs/adr/` — ADR-011 … ADR-021
 - `deploy/profiles/` — артефакты по профилям
 - `configs/` — примеры конфигураций
 - `AGENTS.md` — правила для coding-агентов

@@ -17,6 +17,8 @@ pub enum ConfigError {
     Parse(String),
     /// Некорректный CIDR.
     InvalidCidr(String),
+    /// Некорректная per-client конфигурация.
+    InvalidClient(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -24,6 +26,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Parse(e) => write!(f, "config parse error: {e}"),
             Self::InvalidCidr(e) => write!(f, "invalid CIDR: {e}"),
+            Self::InvalidClient(e) => write!(f, "invalid client: {e}"),
         }
     }
 }
@@ -60,6 +63,17 @@ struct RawConfig {
 struct RawServer {
     #[serde(default)]
     address_rules: RawAddressRules,
+    #[serde(default)]
+    clients: Vec<RawClient>,
+}
+
+#[derive(Deserialize)]
+struct RawClient {
+    client_id: String,
+    key_material: String,
+    #[serde(default)]
+    revoked: bool,
+    max_sessions: Option<u32>,
 }
 
 fn default_allow_ports_low() -> Vec<u16> {
@@ -186,6 +200,99 @@ static PRIVATE_DENY: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
         .map(|s| s.parse().unwrap())
         .collect()
 });
+
+/// Один клиент.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEntry {
+    /// Идентификатор клиента (не секрет).
+    pub client_id: String,
+    /// SHA-256 fingerprint DER-сертификата (hex).
+    pub fingerprint: String,
+    /// Отозван ли клиент.
+    pub revoked: bool,
+    /// Максимум одновременных сессий (`None` = без ограничения).
+    pub max_sessions: Option<u32>,
+}
+
+/// Реестр клиентов.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientRegistry {
+    entries: Vec<ClientEntry>,
+}
+
+impl ClientRegistry {
+    /// Парсит `[[server.clients]]` из TOML, загружает сертификаты,
+    /// вычисляет fingerprint и валидирует (непустой `client_id`,
+    /// уникальность `client_id` и fingerprint, читаемость `key_material`).
+    pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
+        let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let mut entries = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_fps = std::collections::HashSet::new();
+
+        for c in raw.server.clients {
+            if c.client_id.trim().is_empty() {
+                return Err(ConfigError::InvalidClient("empty client_id".into()));
+            }
+            if !seen_ids.insert(c.client_id.clone()) {
+                return Err(ConfigError::InvalidClient(format!(
+                    "duplicate client_id: {}",
+                    c.client_id
+                )));
+            }
+            let der = load_cert_der(&c.key_material)?;
+            let fp = crypto::fingerprint(&der);
+            if !seen_fps.insert(fp.clone()) {
+                return Err(ConfigError::InvalidClient(format!(
+                    "duplicate fingerprint: {fp}"
+                )));
+            }
+            entries.push(ClientEntry {
+                client_id: c.client_id,
+                fingerprint: fp,
+                revoked: c.revoked,
+                max_sessions: c.max_sessions,
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Ищет клиента по fingerprint сертификата.
+    pub fn find_by_fingerprint(&self, fingerprint: &str) -> Option<&ClientEntry> {
+        self.entries.iter().find(|e| e.fingerprint == fingerprint)
+    }
+
+    /// Итератор по клиентам.
+    pub fn iter(&self) -> impl Iterator<Item = &ClientEntry> {
+        self.entries.iter()
+    }
+
+    /// Количество клиентов.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Пуст ли реестр.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Загружает DER-сертификат из `key_material` (путь к файлу или inline PEM).
+fn load_cert_der(key_material: &str) -> Result<Vec<u8>, ConfigError> {
+    let pem = if key_material.trim_start().starts_with("-----BEGIN") {
+        key_material.to_string()
+    } else {
+        std::fs::read_to_string(key_material).map_err(|e| {
+            ConfigError::InvalidClient(format!("cannot read key_material {key_material}: {e}"))
+        })?
+    };
+    let der = rustls_pemfile::certs(&mut pem.as_bytes())
+        .next()
+        .ok_or_else(|| ConfigError::InvalidClient("no certificate in key_material".into()))?
+        .map_err(|e| ConfigError::InvalidClient(format!("bad key_material: {e}")))?;
+    Ok(der.as_ref().to_vec())
+}
 
 #[cfg(test)]
 mod tests {
@@ -316,6 +423,46 @@ mod tests {
     fn public_high_port_allowed() {
         let rules = AddressRules::default();
         assert_eq!(rules.check(ip4(8, 8, 8, 8), 8443), Ok(()));
+    }
+
+    #[test]
+    fn parse_clients() {
+        let (ca_cert, ca_key) = crypto::generate_ca().unwrap();
+        let client = crypto::generate_client_cert("alice", &ca_cert, &ca_key).unwrap();
+        let path = std::env::temp_dir().join(format!("netcore-test-{}.crt", std::process::id()));
+        std::fs::write(&path, &client.cert_pem).unwrap();
+
+        let toml = format!(
+            "[[server.clients]]\nclient_id = \"alice\"\nkey_material = \"{}\"\nmax_sessions = 5\n",
+            path.display()
+        );
+        let reg = ClientRegistry::from_toml(&toml).unwrap();
+        assert_eq!(reg.len(), 1);
+        let e = reg.find_by_fingerprint(&client.fingerprint).unwrap();
+        assert_eq!(e.client_id, "alice");
+        assert_eq!(e.max_sessions, Some(5));
+        assert!(!e.revoked);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn clients_validation() {
+        // Пустой client_id — отказ до чтения key_material.
+        assert!(ClientRegistry::from_toml(
+            "[[server.clients]]\nclient_id = \"\"\nkey_material = \"missing.crt\""
+        )
+        .is_err());
+
+        // Дубликат client_id — отказ.
+        let (ca_cert, ca_key) = crypto::generate_ca().unwrap();
+        let c1 = crypto::generate_client_cert("dup", &ca_cert, &ca_key).unwrap();
+        let c2 = crypto::generate_client_cert("dup", &ca_cert, &ca_key).unwrap();
+        let toml = format!(
+            "[[server.clients]]\nclient_id = \"dup\"\nkey_material = '''{}'''\n\
+             [[server.clients]]\nclient_id = \"dup\"\nkey_material = '''{}'''\n",
+            c1.cert_pem, c2.cert_pem
+        );
+        assert!(ClientRegistry::from_toml(&toml).is_err());
     }
 
     #[test]
