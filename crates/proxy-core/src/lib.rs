@@ -9,13 +9,19 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use transport_tls::{ClientTransport, ServerTransport, Transport};
 
 /// Интервал опроса relay-цикла (таймаут чтения на обеих сторонах).
 pub const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Таймаут ожидания `ConnectAck` на клиенте.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Таймаут установления TCP-соединения к цели на сервере.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ошибка SOCKS5-режима.
 #[derive(Debug)]
@@ -34,6 +40,10 @@ pub enum ProxyError {
     NoAcceptableMethod,
     /// Прикладное сообщение имеет неожиданный тип (ожидался `Connect`).
     UnexpectedMessage(protocol::MessageKind),
+    /// Истёк таймаут ожидания `ConnectAck` от сервера.
+    ConnectAckTimeout,
+    /// Некорректный `ConnectAck` (битый payload).
+    BadConnectAck,
 }
 
 impl fmt::Display for ProxyError {
@@ -46,6 +56,8 @@ impl fmt::Display for ProxyError {
             Self::CommandNotSupported(c) => write!(f, "command not supported: {c:?}"),
             Self::NoAcceptableMethod => write!(f, "no acceptable authentication method"),
             Self::UnexpectedMessage(k) => write!(f, "unexpected protocol message kind: {k:?}"),
+            Self::ConnectAckTimeout => write!(f, "timed out waiting for ConnectAck"),
+            Self::BadConnectAck => write!(f, "malformed ConnectAck"),
         }
     }
 }
@@ -135,14 +147,89 @@ pub fn read_connect_target<R: Read>(reader: &mut R) -> Result<socks5::Target, Pr
     Ok(target)
 }
 
-/// Устанавливает TCP-соединение к цели.
-fn connect_target(target: &socks5::Target) -> io::Result<TcpStream> {
+/// Отправляет `ConnectAck` по прикладному протоколу (сервер → клиент).
+///
+/// Payload — один байт REP-кода: `0x00` = успех, иначе код ошибки.
+pub fn write_connect_ack<W: Write>(writer: &mut W, rep_code: u8) -> Result<(), ProxyError> {
+    protocol::write_message(
+        writer,
+        &protocol::Message::new(protocol::MessageKind::ConnectAck, vec![rep_code]),
+    )?;
+    Ok(())
+}
+
+/// Читает `ConnectAck` и возвращает REP-код (`0x00` = успех).
+///
+/// Отличает таймаут чтения ([`ProxyError::ConnectAckTimeout`]) от битого
+/// payload ([`ProxyError::BadConnectAck`]).
+pub fn read_connect_ack<R: Read>(reader: &mut R) -> Result<u8, ProxyError> {
+    let mut header = [0u8; protocol::HEADER_LEN];
+    if let Err(e) = reader.read_exact(&mut header) {
+        return Err(if is_retryable(&e) {
+            ProxyError::ConnectAckTimeout
+        } else {
+            ProxyError::Io(e)
+        });
+    }
+
+    if header[0] != protocol::VERSION {
+        return Err(ProxyError::Protocol(
+            protocol::ProtocolError::UnsupportedVersion {
+                got: header[0],
+                supported: protocol::VERSION,
+            },
+        ));
+    }
+
+    let kind = protocol::MessageKind::from_u8(header[1])?;
+    if kind != protocol::MessageKind::ConnectAck {
+        return Err(ProxyError::UnexpectedMessage(kind));
+    }
+
+    let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    if len != 1 {
+        return Err(ProxyError::BadConnectAck);
+    }
+
+    let mut payload = [0u8; 1];
+    reader.read_exact(&mut payload).map_err(ProxyError::Io)?;
+    Ok(payload[0])
+}
+
+/// Сопоставляет ошибку TCP-connect с SOCKS5 REP-кодом.
+fn map_connect_error(e: &io::Error) -> u8 {
+    match e.kind() {
+        io::ErrorKind::ConnectionRefused => socks5::REP_CONNECTION_REFUSED,
+        io::ErrorKind::NetworkUnreachable => socks5::REP_NETWORK_UNREACHABLE,
+        io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => socks5::REP_HOST_UNREACHABLE,
+        _ => socks5::REP_GENERAL_FAILURE,
+    }
+}
+
+/// Устанавливает TCP-соединение к цели с таймаутом.
+fn connect_target(target: &socks5::Target, timeout: Duration) -> io::Result<TcpStream> {
     match &target.addr {
-        socks5::Addr::IPv4(b) => TcpStream::connect((Ipv4Addr::from(*b), target.port)),
-        socks5::Addr::IPv6(b) => TcpStream::connect((Ipv6Addr::from(*b), target.port)),
+        socks5::Addr::IPv4(b) => TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::from(*b), target.port)),
+            timeout,
+        ),
+        socks5::Addr::IPv6(b) => TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv6Addr::from(*b), target.port)),
+            timeout,
+        ),
         socks5::Addr::Domain(d) => {
             let host = String::from_utf8_lossy(d).into_owned();
-            TcpStream::connect((host.as_str(), target.port))
+            let addrs: Vec<SocketAddr> = (host.as_str(), target.port).to_socket_addrs()?.collect();
+            let mut last_err = None;
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, timeout) {
+                    Ok(sock) => return Ok(sock),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::HostUnreachable, "no address resolved")
+            }))
         }
     }
 }
@@ -153,6 +240,7 @@ fn connect_target(target: &socks5::Target) -> io::Result<TcpStream> {
 pub fn serve_client_connection(
     mut app: TcpStream,
     mut client: ClientTransport,
+    ack_timeout: Duration,
 ) -> Result<(), ProxyError> {
     let target = handshake(&mut app)?;
 
@@ -165,7 +253,8 @@ pub fn serve_client_connection(
         );
         return Err(ProxyError::Transport(e));
     }
-    client.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
+
+    client.set_read_timeout(Some(ack_timeout))?;
 
     if let Err(e) = write_connect_target(&mut client, &target) {
         let _ = socks5::write_reply(
@@ -177,6 +266,35 @@ pub fn serve_client_connection(
         return Err(e);
     }
 
+    // Ждём подтверждение соединения с целью от сервера.
+    let rep = match read_connect_ack(&mut client) {
+        Ok(rep) => rep,
+        Err(ProxyError::ConnectAckTimeout) => {
+            let _ = socks5::write_reply(
+                &mut app,
+                socks5::REP_HOST_UNREACHABLE,
+                &socks5::Addr::IPv4([0, 0, 0, 0]),
+                0,
+            );
+            return Ok(());
+        }
+        Err(_) => {
+            let _ = socks5::write_reply(
+                &mut app,
+                socks5::REP_GENERAL_FAILURE,
+                &socks5::Addr::IPv4([0, 0, 0, 0]),
+                0,
+            );
+            return Ok(());
+        }
+    };
+
+    if rep != socks5::REP_SUCCESS {
+        let _ = socks5::write_reply(&mut app, rep, &socks5::Addr::IPv4([0, 0, 0, 0]), 0);
+        return Ok(());
+    }
+
+    client.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
     socks5::write_reply(
         &mut app,
         socks5::REP_SUCCESS,
@@ -187,9 +305,22 @@ pub fn serve_client_connection(
 }
 
 /// Обрабатывает одно соединение на стороне сервера (TLS → TCP-цель).
-pub fn serve_server_connection(mut server: ServerTransport) -> Result<(), ProxyError> {
+pub fn serve_server_connection(
+    mut server: ServerTransport,
+    connect_timeout: Duration,
+) -> Result<(), ProxyError> {
     let target = read_connect_target(&mut server)?;
-    let tcp = connect_target(&target).map_err(ProxyError::Io)?;
+
+    let tcp = match connect_target(&target, connect_timeout) {
+        Ok(tcp) => tcp,
+        Err(e) => {
+            let rep = map_connect_error(&e);
+            let _ = write_connect_ack(&mut server, rep);
+            return Ok(());
+        }
+    };
+
+    write_connect_ack(&mut server, socks5::REP_SUCCESS)?;
     server.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
     relay(tcp, server).map_err(ProxyError::Io)
 }

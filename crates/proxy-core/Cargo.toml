@@ -12,5 +12,6 @@ transport-tls = { path = "../transport-tls" }
 [dev-dependencies]
 transport-tls = { path = "../transport-tls" }
 socks5 = { path = "../socks5" }
+protocol = { path = "../protocol" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

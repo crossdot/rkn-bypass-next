@@ -1,13 +1,6 @@
 # Ограничения SOCKS5-режима (MVP)
 
 ## Известные ограничения
-- **Оптимистичный REP_SUCCESS.** Клиент сообщает об успехе до
-  подтверждения соединения с целью. См. ADR-019. Будет исправлено
-  ack-протоколом.
-- **IPv6-цели.** Relay обрабатывает ATYP=IPv6, но end-to-end тест
-  с реальной IPv6-целью отсутствует. В среде без IPv6-маршрута
-  клиент получает `ENETUNREACH`. Это корректное поведение,
-  но требует теста.
 - **Ограничения по адресам на сервере.** Сервер пока открывает TCP
   к любому запрошенному адресу. Ограничения — следующий шаг.
 - **Нет UDP ASSOCIATE и BIND.** Обе команды отклоняются с `0x07`
@@ -15,11 +8,20 @@
 - **Thread-per-connection.** Масштабируется ограниченно; async —
   Phase 2 (ADR-017).
 
+## Реализовано: ack-протокол (P3-fix)
+- Сервер после `TcpStream::connect` к цели отправляет `ConnectAck`
+  (payload = 1 байт REP-кода). Клиент ждёт ack с таймаутом
+  (`ACK_TIMEOUT`) и только затем отправляет `REP_SUCCESS`.
+- Ошибки connect маппятся в REP-коды: `ConnectionRefused → 0x05`,
+  `NetworkUnreachable → 0x03`, `HostUnreachable/TimedOut → 0x04`,
+  прочее → `0x01`. Таймаут ack → `0x04`.
+
 ## Что проверено
 - `curl -4 --socks5 127.0.0.1:1080 http://example.com` → HTTP 200.
 - `curl --socks5-hostname 127.0.0.1:1080 http://example.com` → HTTP 200.
-- 26 автоматических тестов, включая relay mid-transfer, 8 конкурентных
-  CONNECT, отказ UDP/BIND.
+- 30 автоматических тестов: relay mid-transfer, 8 конкурентных CONNECT,
+  отказ UDP/BIND, connection-refused (0x05), ack-timeout (0x04),
+  битый ConnectAck (0x01), IPv6-loopback (::1).
 
 ## Что не проверено в этой среде
 - Точная команда `curl --socks5 127.0.0.1:1080 http://example.com`

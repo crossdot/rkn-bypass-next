@@ -51,7 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            if let Err(e) = proxy_core::serve_client_connection(app, client) {
+            if let Err(e) =
+                proxy_core::serve_client_connection(app, client, proxy_core::ACK_TIMEOUT)
+            {
                 eprintln!("connection error: {e}");
             }
         });

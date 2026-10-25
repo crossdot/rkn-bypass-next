@@ -59,9 +59,28 @@ fn socket_pair() -> (TcpStream, TcpStream) {
     (a, b)
 }
 
-/// TCP echo-сервер, принимающий ровно `n` соединений.
-fn spawn_echo_target(n: usize) -> SocketAddr {
+/// Закрытый (не слушающий) порт на 127.0.0.1.
+fn closed_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+fn target_from_socket(addr: SocketAddr) -> socks5::Target {
+    let a = match addr.ip() {
+        IpAddr::V4(ip) => socks5::Addr::IPv4(ip.octets()),
+        IpAddr::V6(ip) => socks5::Addr::IPv6(ip.octets()),
+    };
+    socks5::Target {
+        addr: a,
+        port: addr.port(),
+    }
+}
+
+/// TCP echo-сервер на заданном адресе, принимающий ровно `n` соединений.
+fn spawn_echo_target_on(bind: &str, n: usize) -> SocketAddr {
+    let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
         for _ in 0..n {
@@ -98,15 +117,33 @@ fn spawn_tls_server(config: Arc<ServerConfig>, n: usize) -> SocketAddr {
             let config = Arc::clone(&config);
             thread::spawn(move || {
                 let server = ServerTransport::accept(sock, config, Duration::from_secs(5)).unwrap();
-                let _ = proxy_core::serve_server_connection(server);
+                let _ = proxy_core::serve_server_connection(server, Duration::from_secs(5));
             });
         }
     });
     addr
 }
 
-/// Прогоняет полный клиентский сценарий и возвращает полученный эхо-ответ.
-fn run_connect(server_addr: SocketAddr, target_addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+/// TLS-сервер с произвольным поведением после приёма соединения.
+fn spawn_fake_server<F: FnOnce(ServerTransport) + Send + 'static>(behavior: F) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_cfg = load_server_config();
+    thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let server = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5)).unwrap();
+        behavior(server);
+    });
+    addr
+}
+
+/// Прогоняет полный клиентский сценарий и возвращает REP-код и эхо-данные.
+fn run_connect(
+    server_addr: SocketAddr,
+    target_addr: SocketAddr,
+    ack_timeout: Duration,
+    payload: &[u8],
+) -> (u8, Vec<u8>) {
     let (mut app, proxy_side) = socket_pair();
     let client_cfg = load_client_config(true);
 
@@ -119,7 +156,7 @@ fn run_connect(server_addr: SocketAddr, target_addr: SocketAddr, payload: &[u8])
             Duration::from_secs(5),
         )
         .unwrap();
-        proxy_core::serve_client_connection(proxy_side, client)
+        proxy_core::serve_client_connection(proxy_side, client, ack_timeout)
     });
 
     // SOCKS5 greeting: version 5, 1 method, no-auth.
@@ -128,29 +165,28 @@ fn run_connect(server_addr: SocketAddr, target_addr: SocketAddr, payload: &[u8])
     app.read_exact(&mut sel).unwrap();
     assert_eq!(sel, [0x05, 0x00]);
 
-    // CONNECT-запрос к цели (IPv4).
-    let mut req = vec![0x05, 0x01, 0x00, 0x01];
-    match target_addr.ip() {
-        IpAddr::V4(ip) => req.extend_from_slice(&ip.octets()),
-        IpAddr::V6(ip) => req.extend_from_slice(&ip.octets()),
-    }
-    req.extend_from_slice(&target_addr.port().to_be_bytes());
+    // CONNECT-запрос к цели.
+    let mut req = vec![0x05, 0x01, 0x00];
+    req.extend_from_slice(&target_from_socket(target_addr).encode());
     app.write_all(&req).unwrap();
 
-    // Ответ успеха: VER REP RSV ATYP BND.ADDR BND.PORT.
+    // Ответ: VER REP RSV ATYP BND.ADDR BND.PORT (10 байт).
     let mut reply = [0u8; 10];
     app.read_exact(&mut reply).unwrap();
     assert_eq!(reply[0], 0x05);
-    assert_eq!(reply[1], 0x00);
+    let rep = reply[1];
 
-    // Передаём данные и читаем эхо.
-    app.write_all(payload).unwrap();
-    let mut out = vec![0u8; payload.len()];
-    app.read_exact(&mut out).unwrap();
+    let mut echoed = Vec::new();
+    if rep == 0x00 {
+        app.write_all(payload).unwrap();
+        let mut out = vec![0u8; payload.len()];
+        app.read_exact(&mut out).unwrap();
+        echoed = out;
+    }
 
     drop(app);
     let _ = handle.join();
-    out
+    (rep, echoed)
 }
 
 #[test]
@@ -186,7 +222,7 @@ fn handshake_udp_associate_rejected() {
     let mut resp = [0u8; 2 + 10];
     client.read_exact(&mut resp).unwrap();
     assert_eq!(&resp[..2], &[0x05, 0x00]);
-    assert_eq!(resp[3], 0x07); // command not supported
+    assert_eq!(resp[3], 0x07);
 }
 
 #[test]
@@ -232,7 +268,6 @@ fn relay_mid_transfer_drop() {
     remote.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hello");
 
-    // Удалённая сторона шлёт часть данных и обрывает соединение.
     remote.write_all(b"world").unwrap();
     drop(remote);
 
@@ -241,7 +276,7 @@ fn relay_mid_transfer_drop() {
     assert_eq!(&buf2, b"world");
 
     let mut rest = [0u8; 1];
-    assert_eq!(app.read(&mut rest).unwrap(), 0); // EOF после обрыва
+    assert_eq!(app.read(&mut rest).unwrap(), 0);
 
     let _ = handle.join();
 }
@@ -249,31 +284,96 @@ fn relay_mid_transfer_drop() {
 #[test]
 fn end_to_end_connect_echo() {
     ensure_crypto_provider();
-    let target_addr = spawn_echo_target(1);
+    let target_addr = spawn_echo_target_on("127.0.0.1:0", 1);
     let server_cfg = load_server_config();
     let server_addr = spawn_tls_server(server_cfg, 1);
 
-    let got = run_connect(server_addr, target_addr, b"hello");
-    assert_eq!(got, b"hello");
+    let (rep, echoed) = run_connect(server_addr, target_addr, Duration::from_secs(5), b"hello");
+    assert_eq!(rep, 0x00);
+    assert_eq!(echoed, b"hello");
 }
 
 #[test]
 fn concurrent_connects() {
     ensure_crypto_provider();
     let n = 8;
-    let target_addr = spawn_echo_target(n);
+    let target_addr = spawn_echo_target_on("127.0.0.1:0", n);
     let server_cfg = load_server_config();
     let server_addr = spawn_tls_server(server_cfg, n);
 
     let handles: Vec<_> = (0..n)
         .map(|i| {
             let payload = format!("payload-{i}").into_bytes();
-            thread::spawn(move || run_connect(server_addr, target_addr, &payload))
+            thread::spawn(move || {
+                run_connect(server_addr, target_addr, Duration::from_secs(5), &payload)
+            })
         })
         .collect();
 
     for (i, handle) in handles.into_iter().enumerate() {
-        let got = handle.join().unwrap();
-        assert_eq!(got, format!("payload-{i}").into_bytes());
+        let (rep, echoed) = handle.join().unwrap();
+        assert_eq!(rep, 0x00);
+        assert_eq!(echoed, format!("payload-{i}").into_bytes());
     }
+}
+
+#[test]
+fn connect_refused_reports_rep() {
+    ensure_crypto_provider();
+    let target = SocketAddr::from(([127, 0, 0, 1], closed_port()));
+    let server_cfg = load_server_config();
+    let server_addr = spawn_tls_server(server_cfg, 1);
+
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x05); // connection refused
+}
+
+#[test]
+fn connect_ack_timeout_reports_rep() {
+    ensure_crypto_provider();
+    // Сервер читает цель, но не отвечает ack — клиент должен выйти по таймауту.
+    let server_addr = spawn_fake_server(|mut server| {
+        let _ = proxy_core::read_connect_target(&mut server);
+        thread::sleep(Duration::from_secs(5));
+    });
+
+    let target = SocketAddr::from(([127, 0, 0, 1], 80));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_millis(300), b"");
+    assert_eq!(rep, 0x04); // host unreachable (ack timeout)
+}
+
+#[test]
+fn bad_connect_ack_reports_failure() {
+    ensure_crypto_provider();
+    // Сервер отправляет битый ConnectAck (payload 2 байта вместо 1).
+    let server_addr = spawn_fake_server(|mut server| {
+        let _ = proxy_core::read_connect_target(&mut server);
+        protocol::write_message(
+            &mut server,
+            &protocol::Message::new(protocol::MessageKind::ConnectAck, vec![0x00, 0x00]),
+        )
+        .unwrap();
+    });
+
+    let target = SocketAddr::from(([127, 0, 0, 1], 80));
+    let (rep, _) = run_connect(server_addr, target, Duration::from_secs(5), b"");
+    assert_eq!(rep, 0x01); // general failure (malformed ack)
+}
+
+#[test]
+fn ipv6_loopback() {
+    ensure_crypto_provider();
+    // Явный скип, если IPv6 loopback недоступен.
+    if TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("IPv6 loopback not supported; skipping ipv6_loopback");
+        return;
+    }
+
+    let target_addr = spawn_echo_target_on("[::1]:0", 1);
+    let server_cfg = load_server_config();
+    let server_addr = spawn_tls_server(server_cfg, 1);
+
+    let (rep, echoed) = run_connect(server_addr, target_addr, Duration::from_secs(5), b"hello");
+    assert_eq!(rep, 0x00);
+    assert_eq!(echoed, b"hello");
 }

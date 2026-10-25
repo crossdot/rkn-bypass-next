@@ -36,6 +36,8 @@ pub enum MessageKind {
     Control = 0x01,
     /// Запрос CONNECT: передача цели (адрес + порт) клиент → сервер.
     Connect = 0x02,
+    /// Подтверждение CONNECT: REP-код (payload 1 байт) сервер → клиент.
+    ConnectAck = 0x03,
 }
 
 impl MessageKind {
@@ -46,6 +48,7 @@ impl MessageKind {
         match value {
             0x01 => Ok(Self::Control),
             0x02 => Ok(Self::Connect),
+            0x03 => Ok(Self::ConnectAck),
             other => Err(ProtocolError::UnknownMessageKind(other)),
         }
     }

@@ -50,7 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::spawn(move || {
             match ServerTransport::accept(sock, config, Duration::from_secs(10)) {
                 Ok(server) => {
-                    if let Err(e) = proxy_core::serve_server_connection(server) {
+                    if let Err(e) =
+                        proxy_core::serve_server_connection(server, proxy_core::CONNECT_TIMEOUT)
+                    {
                         eprintln!("connection error: {e}");
                     }
                 }
