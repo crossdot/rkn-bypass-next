@@ -1,0 +1,43 @@
+# Client configuration example
+#
+# Оси конфигурации:
+#   mode    = "socks5" (MVP) | "tun" (Phase 2)
+#   entry   = "none" (MVP) | "wireguard" (MVP, опционально)
+#   profile = "direct" | "camouflaged"
+
+mode = "socks5"
+entry = "none"
+profile = "direct"
+
+[transport]
+type = "tls"
+
+[socks5]
+listen = "127.0.0.1:1080"
+# allow_udp_associate = false  # MVP: TCP CONNECT only
+
+# ------------------------------------------------------------
+# wireguard-entry (AmneziaWG) — MVP, опционально
+# Раскомментировать при entry = "wireguard".
+# См. ADR-016.
+# ------------------------------------------------------------
+# [wireguard_entry]
+# enabled = true
+# listen = "0.0.0.0:51820"
+# protocol = "amneziawg"     # только amneziawg; wireguard запрещён
+# transport = "udp"          # "udp" | "tcp" (tcp/443 для мобильных)
+# min_version = "3.1"
+# Параметры обфускации должны совпадать на обеих сторонах.
+# jc = 6
+# jmin = 50
+# jmax = 100
+# s1 = 80
+# s2 = 40
+# h1 = 1234567890
+
+# ------------------------------------------------------------
+# TUN — Phase 2 (после SOCKS5). Не включать в MVP.
+# ------------------------------------------------------------
+# [tun]
+# interface = "netcore0"
+# mtu = 1400

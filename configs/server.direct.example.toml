@@ -1,0 +1,9 @@
+# Profile A — Direct (MVP)
+profile = "direct"
+
+[listen]
+addr = "0.0.0.0:443"
+
+[tls]
+cert = "/etc/netcore/cert.pem"
+key = "/etc/netcore/key.pem"

@@ -1,0 +1,12 @@
+# Profile B — Camouflaged entry (MVP)
+profile = "camouflaged"
+
+[listen]
+addr = "0.0.0.0:443"
+
+[reality]
+dest = "127.0.0.1:8443"
+server_names = ["your-domain.example"]
+
+[fallback]
+nginx_upstream = "http://127.0.0.1:8443"
