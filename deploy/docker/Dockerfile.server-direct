@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+
+# ===== build =====
+FROM rust:1.85-slim AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY apps ./apps
+RUN cargo build --release -p server
+
+# ===== runtime (non-root, slim) =====
+FROM debian:bookworm-slim
+RUN groupadd -r -g 10001 netcore && useradd -r -u 10001 -g 10001 -s /usr/sbin/nologin netcore
+
+COPY --from=builder /build/target/release/server /usr/local/bin/netcore-server
+
+ENV LISTEN_ADDR=0.0.0.0:8443 \
+    CERT_PATH=/certs/server.crt \
+    KEY_PATH=/certs/server.key \
+    CA_PATH=/certs/ca.crt \
+    RULES_PATH=
+
+USER 10001:10001
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/netcore-server"]

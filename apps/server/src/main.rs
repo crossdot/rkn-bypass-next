@@ -1,5 +1,9 @@
 //! TLS-сервер: принимает логические потоки от клиента и открывает
 //! TCP к запрошенному адресу (с проверкой адресных правил).
+//!
+//! Конфигурация через переменные окружения (с дефолтами для нативной
+//! разработки): `LISTEN_ADDR`, `CERT_PATH`, `KEY_PATH`, `CA_PATH`,
+//! `RULES_PATH`.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -12,13 +16,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use transport_tls::{ensure_crypto_provider, ServerTransport};
 
-const LISTEN_ADDR: &str = "127.0.0.1:8443";
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
 
-fn load_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
-    let cert_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.crt");
-    let ca_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt");
-    let key_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.key");
-
+fn load_tls_config(
+    cert_path: &str,
+    ca_path: &str,
+    key_path: &str,
+) -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
     let mut certs: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
             .collect::<Result<_, _>>()?;
@@ -38,9 +44,9 @@ fn load_tls_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
     ))
 }
 
-/// Загружает адресные правила из TOML (`argv[1]`), иначе — безопасный default.
+/// Загружает адресные правила из `RULES_PATH`, иначе — безопасный default.
 fn load_address_rules() -> config::AddressRules {
-    let Some(path) = std::env::args().nth(1) else {
+    let Some(path) = std::env::var("RULES_PATH").ok().filter(|s| !s.is_empty()) else {
         return config::AddressRules::default();
     };
     match std::fs::read_to_string(&path) {
@@ -60,10 +66,25 @@ fn load_address_rules() -> config::AddressRules {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
-    let tls_config = load_tls_config()?;
+
+    let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:8443");
+    let cert_path = env_or(
+        "CERT_PATH",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.crt"),
+    );
+    let ca_path = env_or(
+        "CA_PATH",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt"),
+    );
+    let key_path = env_or(
+        "KEY_PATH",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.key"),
+    );
+
+    let tls_config = load_tls_config(&cert_path, &ca_path, &key_path)?;
     let rules = load_address_rules();
-    let listener = TcpListener::bind(LISTEN_ADDR)?;
-    println!("TLS server listening on {LISTEN_ADDR}");
+    let listener = TcpListener::bind(&listen_addr)?;
+    println!("TLS server listening on {listen_addr}");
 
     for stream in listener.incoming() {
         let sock = stream?;

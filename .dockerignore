@@ -1,0 +1,10 @@
+# Контекст сборки Docker-образов: только исходники workspace.
+target/
+.git/
+.github/
+docs/
+configs/
+deploy/
+certs/
+netcore-docs/
+*.md

@@ -1,9 +1,12 @@
 //! SOCKS5-клиент: принимает CONNECT от приложений и проксирует их
 //! через TLS к серверу.
+//!
+//! Конфигурация через переменные окружения (с дефолтами для нативной
+//! разработки): `LISTEN_ADDR`, `SERVER_ADDR`, `CA_PATH`.
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -11,11 +14,11 @@ use std::time::Duration;
 use rustls::{ClientConfig, RootCertStore};
 use transport_tls::{ensure_crypto_provider, ClientTransport};
 
-const SERVER_ADDR: &str = "127.0.0.1:8443";
-const LISTEN_ADDR: &str = "127.0.0.1:1080";
+fn env_or(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
 
-fn load_client_config() -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
-    let ca_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt");
+fn load_client_config(ca_path: &str) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(ca_path)?)) {
         roots.add(cert?)?;
@@ -29,10 +32,22 @@ fn load_client_config() -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>>
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
-    let config = load_client_config()?;
-    let server_addr: SocketAddr = SERVER_ADDR.parse()?;
-    let listener = TcpListener::bind(LISTEN_ADDR)?;
-    println!("SOCKS5 listening on {LISTEN_ADDR}");
+
+    let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:1080");
+    let server_addr_str = env_or("SERVER_ADDR", "127.0.0.1:8443");
+    let server_addr: SocketAddr = server_addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve SERVER_ADDR {server_addr_str}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("SERVER_ADDR {server_addr_str} resolved to no address"))?;
+    let ca_path = env_or(
+        "CA_PATH",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt"),
+    );
+
+    let config = load_client_config(&ca_path)?;
+    let listener = TcpListener::bind(&listen_addr)?;
+    println!("SOCKS5 listening on {listen_addr} (server {server_addr})");
 
     for stream in listener.incoming() {
         let app = stream?;
