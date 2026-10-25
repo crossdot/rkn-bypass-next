@@ -6,7 +6,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -74,6 +74,16 @@ fn load_client_registry() -> config::ClientRegistry {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
+    // Аудит-логи: компактный key=value на stderr; уровень по умолчанию info
+    // (переопределяется RUST_LOG). См. ADR-021 «Аудит handshake'ей».
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
     let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:8443");
     let cert_path = env_or(
@@ -102,17 +112,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for cert in load_certs(&ca_path)? {
         client_roots.add(cert)?;
     }
-    let auth = server::AuthClientVerifier::new(Arc::new(client_roots), Arc::clone(&registry))?;
-    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
+    // Внутренний верификатор цепочки — один раз, шарится между соединениями.
+    let inner = server::AuthClientVerifier::build_inner(Arc::new(client_roots))?;
 
     let mut certs = load_certs(&cert_path)?;
     certs.extend(load_certs(&ca_path)?);
     let key = load_key(&key_path)?;
-    let tls_config = Arc::new(
-        ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?,
-    );
 
     let sessions = Arc::new(server::SessionManager::new());
     let listener = TcpListener::bind(&listen_addr)?;
@@ -120,11 +125,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for stream in listener.incoming() {
         let sock = stream?;
-        let tls_config = Arc::clone(&tls_config);
+        let remote_addr = sock
+            .peer_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let inner = Arc::clone(&inner);
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
         let rules = rules.clone();
+        let certs = certs.clone();
+        let key = key.clone_key();
         thread::spawn(move || {
+            let auth = server::AuthClientVerifier::new(inner, Arc::clone(&registry), remote_addr);
+            let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
+            let tls_config = match ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+            {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("tls config error: {e}");
+                    return;
+                }
+            };
             match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)) {
                 Ok(transport) => {
                     let Some(der) = transport.peer_certificate_der() else {

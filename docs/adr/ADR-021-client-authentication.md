@@ -79,3 +79,20 @@
   конфигурации.
 - Проверено для toml 0.5.11. При апгрейде toml перепроверить, что
   Display/source() не содержат исходного текста конфига.
+
+## Аудит handshake'ей
+- Событие `event=mtls_handshake` (одна строка, structured): `outcome=ok|rejected`,
+  `reason=unknown_fingerprint|revoked` (только при rejected), `fingerprint=sha256:<hex>`,
+  `client_id=<id>` (если найден), `remote_addr=<ip:port>`.
+- Уровни: `ok` → INFO, `rejected` → WARN. Формат subscriber — compact
+  (`key=value` в строке), уровень по умолчанию info (переопределяется `RUST_LOG`);
+  `grep 'event=mtls_handshake'` работает.
+- Граница scope: отказы TLS-уровня (bad_signature/expired/untrusted chain,
+  отсутствие сертификата) происходят до `verify_client_cert` и на app-уровне
+  не логируются — осознанно, не баг.
+- `fingerprint` — публичный SHA-256 от сертификата, не секрет; PEM/приватные
+  ключи никогда не логируются (проверено негативным тестом `tests/mtls_audit.rs`).
+- remote_addr пробрасывается через per-connection верификатор (`AuthClientVerifier`),
+  без изменения `transport-tls` (`TcpStream::peer_addr()`).
+- Лог-флуд: логируются все отказы (вариант A). Полноценный rate limiting — Phase 2.
+- Чтение: `journalctl -u rkn-server | grep 'event=mtls_handshake' | grep 'outcome=rejected'`.

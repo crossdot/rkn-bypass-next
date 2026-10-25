@@ -15,3 +15,8 @@ config = { path = "../../crates/config" }
 crypto = { path = "../../crates/crypto" }
 transport-tls = { path = "../../crates/transport-tls" }
 proxy-core = { path = "../../crates/proxy-core" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tracing-test = { workspace = true }

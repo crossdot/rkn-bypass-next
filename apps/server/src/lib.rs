@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::HandshakeSignatureValid;
@@ -20,17 +21,30 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error, RootCertStore, Sig
 pub struct AuthClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     registry: Arc<config::ClientRegistry>,
+    remote_addr: SocketAddr,
 }
 
 impl AuthClientVerifier {
-    /// Создаёт верификатор. `roots` — доверенные CA клиентов,
-    /// `registry` — реестр известных клиентов (fingerprint → отзыв).
-    pub fn new(
+    /// Собирает внутренний верификатор цепочки (WebPkiClientVerifier)
+    /// один раз; результат шарится между всеми соединениями.
+    pub fn build_inner(
         roots: Arc<RootCertStore>,
+    ) -> Result<Arc<dyn ClientCertVerifier>, rustls::server::VerifierBuilderError> {
+        WebPkiClientVerifier::builder(roots).build()
+    }
+
+    /// Лёгкая обёртка на одно соединение: разделяемый верификатор цепочки,
+    /// реестр известных клиентов и `remote_addr` (для аудит-событий).
+    pub fn new(
+        inner: Arc<dyn ClientCertVerifier>,
         registry: Arc<config::ClientRegistry>,
-    ) -> Result<Self, rustls::server::VerifierBuilderError> {
-        let inner = WebPkiClientVerifier::builder(roots).build()?;
-        Ok(Self { inner, registry })
+        remote_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            inner,
+            registry,
+            remote_addr,
+        }
     }
 }
 
@@ -53,12 +67,44 @@ impl ClientCertVerifier for AuthClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
+        // Цепочка/подпись/срок проверяются здесь; при неудаче — TLS-уровень
+        // (bad_signature/expired/untrusted), аудит не эмитируется (ADR-021).
         self.inner
             .verify_client_cert(end_entity, intermediates, now)?;
         let fp = crypto::fingerprint(end_entity.as_ref());
+        let fp_display = format!("sha256:{fp}");
         match self.registry.find_by_fingerprint(&fp) {
-            Some(e) if !e.revoked => Ok(ClientCertVerified::assertion()),
-            _ => Err(Error::General("client not authorized".to_string())),
+            Some(e) if !e.revoked => {
+                tracing::info!(
+                    event = %"mtls_handshake",
+                    outcome = %"ok",
+                    fingerprint = %fp_display,
+                    client_id = %e.client_id,
+                    remote_addr = %self.remote_addr,
+                );
+                Ok(ClientCertVerified::assertion())
+            }
+            Some(e) => {
+                tracing::warn!(
+                    event = %"mtls_handshake",
+                    outcome = %"rejected",
+                    reason = %"revoked",
+                    fingerprint = %fp_display,
+                    client_id = %e.client_id,
+                    remote_addr = %self.remote_addr,
+                );
+                Err(Error::General("client not authorized".to_string()))
+            }
+            None => {
+                tracing::warn!(
+                    event = %"mtls_handshake",
+                    outcome = %"rejected",
+                    reason = %"unknown_fingerprint",
+                    fingerprint = %fp_display,
+                    remote_addr = %self.remote_addr,
+                );
+                Err(Error::General("client not authorized".to_string()))
+            }
         }
     }
 

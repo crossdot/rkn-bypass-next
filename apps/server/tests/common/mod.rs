@@ -68,11 +68,15 @@ pub fn registry_with(clients: &[(String, String, bool)]) -> config::ClientRegist
     config::ClientRegistry::from_toml(&toml).unwrap()
 }
 
-pub fn build_server_config(registry: Arc<config::ClientRegistry>) -> Arc<ServerConfig> {
+fn build_server_config(
+    registry: Arc<config::ClientRegistry>,
+    remote_addr: SocketAddr,
+) -> Arc<ServerConfig> {
     let mut certs = certs_from(SERVER_CERT);
     certs.extend(certs_from(CA_CERT));
     let key = key_from(SERVER_KEY);
-    let auth = server::AuthClientVerifier::new(Arc::new(ca_root_store()), registry).unwrap();
+    let inner = server::AuthClientVerifier::build_inner(Arc::new(ca_root_store())).unwrap();
+    let auth = server::AuthClientVerifier::new(inner, registry, remote_addr);
     Arc::new(
         ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(auth))
@@ -93,12 +97,17 @@ pub fn build_client_config(client: &crypto::GeneratedClient) -> Arc<ClientConfig
     )
 }
 
-/// Прогоняет TLS-хендшейк и возвращает, успешен ли он с обеих сторон.
-pub fn handshake_ok(server_config: Arc<ServerConfig>, client_config: Arc<ClientConfig>) -> bool {
+/// Прогоняет TLS-хендшейк с реальным remote_addr (как в main.rs) и
+/// возвращает, успешен ли он с обеих сторон.
+pub fn handshake_ok(
+    registry: Arc<config::ClientRegistry>,
+    client_config: Arc<ClientConfig>,
+) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+        let (sock, peer) = listener.accept().unwrap();
+        let server_config = build_server_config(registry, peer);
         ServerTransport::accept(sock, server_config, Duration::from_secs(5)).is_ok()
     });
     let mut client = ClientTransport::new(
