@@ -88,11 +88,28 @@
   (`key=value` в строке), уровень по умолчанию info (переопределяется `RUST_LOG`);
   `grep 'event=mtls_handshake'` работает.
 - Граница scope: отказы TLS-уровня (bad_signature/expired/untrusted chain,
-  отсутствие сертификата) происходят до `verify_client_cert` и на app-уровне
-  не логируются — осознанно, не баг.
+  `reason=missing_cert`) происходят до `verify_client_cert` и на app-уровне
+  не логируются — осознанно, не баг (`missing_cert` в схеме события нет).
 - `fingerprint` — публичный SHA-256 от сертификата, не секрет; PEM/приватные
   ключи никогда не логируются (проверено негативным тестом `tests/mtls_audit.rs`).
 - remote_addr пробрасывается через per-connection верификатор (`AuthClientVerifier`),
   без изменения `transport-tls` (`TcpStream::peer_addr()`).
 - Лог-флуд: логируются все отказы (вариант A). Полноценный rate limiting — Phase 2.
 - Чтение: `journalctl -u rkn-server | grep 'event=mtls_handshake' | grep 'outcome=rejected'`.
+- TODO: миграция `eprintln!`/`println!` → `tracing` — отдельный спринт; до этого
+  операторы видят два формата (текстовые строки + structured события).
+- `tracing-subscriber` (`env-filter`) тянет транзитивно `matchers` →
+  `regex-automata`/`regex-syntax`. MSRV 1.85 совместимо (сборка зелёная).
+
+## Session resumption — намеренно отключён
+- `ServerConfig` создаётся per-connection (для проброса `remote_addr`), поэтому
+  на каждое соединение rustls заводит свежий `ServerSessionMemoryCache`
+  (дефолт `ServerConfig::builder()`). TLS session resumption между соединениями
+  не работает.
+- Это намеренно, а не баг: в TLS 1.3 resumed-сессии не вызывают
+  `verify_client_cert`, поэтому отозванный клиент с валидным ticket продолжал бы
+  подключаться, а аудит-событие не эмитировалось бы. Это обход отзыва и аудита —
+  прямое противоречие модели угроз (скомпрометированный клиент, отзыв).
+- Отзыв гарантирован только для full handshake; аудит покрывает только
+  full handshake.
+- «Безопасный resumption» (с повторной проверкой отзыва) — будущий ADR, не MVP.
