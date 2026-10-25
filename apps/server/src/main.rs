@@ -1,18 +1,18 @@
-//! Минимальный TLS-сервер: принимает соединения, читает контрольное
-//! сообщение и отвечает подтверждением.
+//! TLS-сервер: принимает логические потоки от клиента и открывает
+//! TCP к запрошенному адресу.
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use transport_tls::{ensure_crypto_provider, ServerTransport, Transport};
+use transport_tls::{ensure_crypto_provider, ServerTransport};
 
-const CONTROL_BYTES: &[u8] = b"rkn-bypass-control";
+const LISTEN_ADDR: &str = "127.0.0.1:8443";
 
 fn load_server_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>> {
     let cert_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.crt");
@@ -38,38 +38,23 @@ fn load_server_config() -> Result<Arc<ServerConfig>, Box<dyn std::error::Error>>
     ))
 }
 
-fn handle(sock: TcpStream, config: Arc<ServerConfig>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut transport = ServerTransport::accept(sock, config, Duration::from_secs(10))?;
-
-    let msg = protocol::read_message(&mut transport)?;
-    if msg.kind != protocol::MessageKind::Control || msg.payload != CONTROL_BYTES {
-        return Err("unexpected control message".into());
-    }
-    println!(
-        "received control bytes: {:?}",
-        String::from_utf8_lossy(&msg.payload)
-    );
-
-    protocol::write_message(
-        &mut transport,
-        &protocol::Message::new(protocol::MessageKind::Control, b"ack".to_vec()),
-    )?;
-    transport.close()?;
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
     let config = load_server_config()?;
-    let listener = TcpListener::bind("127.0.0.1:8443")?;
-    println!("listening on {}", listener.local_addr()?);
+    let listener = TcpListener::bind(LISTEN_ADDR)?;
+    println!("TLS server listening on {LISTEN_ADDR}");
 
     for stream in listener.incoming() {
-        let stream = stream?;
+        let sock = stream?;
         let config = Arc::clone(&config);
         thread::spawn(move || {
-            if let Err(e) = handle(stream, config) {
-                eprintln!("handler error: {e}");
+            match ServerTransport::accept(sock, config, Duration::from_secs(10)) {
+                Ok(server) => {
+                    if let Err(e) = proxy_core::serve_server_connection(server) {
+                        eprintln!("connection error: {e}");
+                    }
+                }
+                Err(e) => eprintln!("handshake error: {e}"),
             }
         });
     }

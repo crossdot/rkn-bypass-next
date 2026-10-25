@@ -1,0 +1,16 @@
+[package]
+name = "proxy-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+socks5 = { path = "../socks5" }
+protocol = { path = "../protocol" }
+transport-tls = { path = "../transport-tls" }
+
+[dev-dependencies]
+transport-tls = { path = "../transport-tls" }
+socks5 = { path = "../socks5" }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

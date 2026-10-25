@@ -34,6 +34,8 @@ pub const MAX_MESSAGE_SIZE: usize = HEADER_LEN + MAX_PAYLOAD_SIZE;
 pub enum MessageKind {
     /// Контрольное сообщение (проверка соединения, контрольные байты).
     Control = 0x01,
+    /// Запрос CONNECT: передача цели (адрес + порт) клиент → сервер.
+    Connect = 0x02,
 }
 
 impl MessageKind {
@@ -43,6 +45,7 @@ impl MessageKind {
     pub fn from_u8(value: u8) -> Result<Self, ProtocolError> {
         match value {
             0x01 => Ok(Self::Control),
+            0x02 => Ok(Self::Connect),
             other => Err(ProtocolError::UnknownMessageKind(other)),
         }
     }

@@ -59,6 +59,14 @@ impl ClientTransport {
             stream: None,
         })
     }
+
+    /// Устанавливает таймаут чтения на подлежащий сокет.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        match self.stream.as_ref() {
+            Some(stream) => stream.sock.set_read_timeout(timeout),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Transport for ClientTransport {
@@ -177,6 +185,11 @@ impl ServerTransport {
         let _ = stream.sock.set_read_timeout(None);
         let _ = stream.sock.set_write_timeout(None);
         Ok(Self { stream })
+    }
+
+    /// Устанавливает таймаут чтения на подлежащий сокет.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.sock.set_read_timeout(timeout)
     }
 }
 

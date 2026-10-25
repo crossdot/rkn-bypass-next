@@ -4,8 +4,10 @@ members = [
     "crates/core-types",
     "crates/config",
     "crates/protocol",
+    "crates/socks5",
     "crates/transport-api",
     "crates/transport-tls",
+    "crates/proxy-core",
     "apps/client",
     "apps/server",
 ]
