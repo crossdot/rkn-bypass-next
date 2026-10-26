@@ -1,0 +1,18 @@
+[package]
+name = "transport-any"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+transport-api = { path = "../transport-api" }
+transport-tls = { path = "../transport-tls" }
+transport-quic = { path = "../transport-quic" }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
+tokio = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+quinn = { workspace = true }

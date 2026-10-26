@@ -69,9 +69,8 @@ async fn make_pair() -> (QuicClientTransport, QuicServerTransport) {
     (client, server)
 }
 
-#[ignore = "TODO(P4b): STREAM frame не доходит до accept_bi после write (quinn driver); разобраться"]
 #[tokio::test(flavor = "multi_thread")]
 async fn contract() {
     ensure_crypto_provider();
-    testkit::contract_suite(make_pair).await;
+    testkit::contract_suite(make_pair, &[testkit::Initiator::Client]).await;
 }

@@ -1,5 +1,7 @@
 //! Общие хелперы интеграционных тестов mTLS (server + client).
 
+#![allow(dead_code)] // каждый тест-бинарь использует лишь часть хелперов
+
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,7 +79,7 @@ fn build_server_config(
     certs.extend(certs_from(CA_CERT));
     let key = key_from(SERVER_KEY);
     let inner = server::AuthClientVerifier::build_inner(Arc::new(ca_root_store())).unwrap();
-    let auth = server::AuthClientVerifier::new(inner, registry, remote_addr);
+    let auth = server::AuthClientVerifier::new(inner, registry, Some(remote_addr));
     Arc::new(
         ServerConfig::builder()
             .with_client_cert_verifier(Arc::new(auth))
@@ -118,6 +120,59 @@ pub async fn handshake_ok(
         "localhost",
         client_config,
         Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let client_ok = client.connect().await.is_ok();
+    client_ok && server.await.unwrap()
+}
+
+// ---- QUIC-хелперы (mTLS revoke over QUIC, ADR-022) ----
+
+/// rustls `ServerConfig` с mTLS для QUIC. Verifier общий на `Endpoint`,
+/// `remote_addr` до handshake недоступен → `None` (ADR-022).
+fn rustls_server_config_quic(registry: Arc<config::ClientRegistry>) -> ServerConfig {
+    let mut certs = certs_from(SERVER_CERT);
+    certs.extend(certs_from(CA_CERT));
+    let key = key_from(SERVER_KEY);
+    let inner = server::AuthClientVerifier::build_inner(Arc::new(ca_root_store())).unwrap();
+    let auth = server::AuthClientVerifier::new(inner, registry, None);
+    ServerConfig::builder()
+        .with_client_cert_verifier(Arc::new(auth))
+        .with_single_cert(certs, key)
+        .unwrap()
+}
+
+pub fn build_client_config_quic(client: &crypto::GeneratedClient) -> quinn::ClientConfig {
+    let rustls_cfg = ClientConfig::builder()
+        .with_root_certificates(ca_root_store())
+        .with_client_auth_cert(
+            certs_from_str(&client.cert_pem),
+            key_from_str(&String::from_utf8_lossy(client.key_pem.expose())),
+        )
+        .unwrap();
+    transport_quic::client_config(rustls_cfg).unwrap()
+}
+
+/// QUIC-mTLS handshake с mTLS-verifier'ом; возвращает успех с обеих сторон.
+pub async fn handshake_ok_quic(
+    registry: Arc<config::ClientRegistry>,
+    client_config: quinn::ClientConfig,
+) -> bool {
+    let server_cfg = transport_quic::server_config(rustls_server_config_quic(registry)).unwrap();
+    let endpoint =
+        Arc::new(quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap());
+    let addr: SocketAddr = endpoint.local_addr().unwrap();
+    let ep = Arc::clone(&endpoint);
+    let server = tokio::spawn(async move {
+        let incoming = ep.accept().await.unwrap();
+        // Полный handshake (0-RTT не используется): успех = mTLS прошёл.
+        incoming.await.is_ok()
+    });
+    let mut client = transport_quic::QuicClientTransport::new(
+        addr,
+        "localhost",
+        client_config,
         Duration::from_secs(5),
     )
     .unwrap();

@@ -21,7 +21,9 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error, RootCertStore, Sig
 pub struct AuthClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     registry: Arc<config::ClientRegistry>,
-    remote_addr: SocketAddr,
+    /// Адрес пира, если известен до handshake. QUIC-верификатор общий для
+    /// Endpoint'а и адрес пира до handshake недоступен → `None` (ADR-022).
+    remote_addr: Option<SocketAddr>,
 }
 
 impl AuthClientVerifier {
@@ -38,7 +40,7 @@ impl AuthClientVerifier {
     pub fn new(
         inner: Arc<dyn ClientCertVerifier>,
         registry: Arc<config::ClientRegistry>,
-        remote_addr: SocketAddr,
+        remote_addr: Option<SocketAddr>,
     ) -> Self {
         Self {
             inner,
@@ -73,6 +75,11 @@ impl ClientCertVerifier for AuthClientVerifier {
             .verify_client_cert(end_entity, intermediates, now)?;
         let fp = crypto::fingerprint(end_entity.as_ref());
         let fp_display = format!("sha256:{fp}");
+        // `None` — адрес недоступен (QUIC pre-handshake, ADR-022).
+        let remote_addr = match self.remote_addr {
+            Some(a) => a.to_string(),
+            None => "-".to_string(),
+        };
         match self.registry.find_by_fingerprint(&fp) {
             Some(e) if !e.revoked => {
                 tracing::info!(
@@ -80,7 +87,7 @@ impl ClientCertVerifier for AuthClientVerifier {
                     outcome = %"ok",
                     fingerprint = %fp_display,
                     client_id = %e.client_id,
-                    remote_addr = %self.remote_addr,
+                    remote_addr = %remote_addr,
                 );
                 Ok(ClientCertVerified::assertion())
             }
@@ -91,7 +98,7 @@ impl ClientCertVerifier for AuthClientVerifier {
                     reason = %"revoked",
                     fingerprint = %fp_display,
                     client_id = %e.client_id,
-                    remote_addr = %self.remote_addr,
+                    remote_addr = %remote_addr,
                 );
                 Err(Error::General("client not authorized".to_string()))
             }
@@ -101,7 +108,7 @@ impl ClientCertVerifier for AuthClientVerifier {
                     outcome = %"rejected",
                     reason = %"unknown_fingerprint",
                     fingerprint = %fp_display,
-                    remote_addr = %self.remote_addr,
+                    remote_addr = %remote_addr,
                 );
                 Err(Error::General("client not authorized".to_string()))
             }

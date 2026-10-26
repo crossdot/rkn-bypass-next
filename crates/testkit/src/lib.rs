@@ -11,11 +11,24 @@ use std::future::Future;
 
 use transport_api::Transport;
 
+/// Кто инициирует bi-stream в [`mid_transfer_drop_detected`].
+///
+/// Нужно потому, что QUIC bi-stream несимметричен: поток открывает одна
+/// сторона, другая принимает. Если инициатор — сервер, клиент должен первым
+/// отправить байт, чтобы открыть поток (иначе серверный `accept_bi` висит).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Initiator {
+    /// Клиент шлёт первый байт, затем сервер шлёт и обрывается (QUIC-совместимо).
+    Client,
+    /// Сервер шлёт первым (транспорт с симметричным двунаправленным потоком, например TLS).
+    Server,
+}
+
 /// Прогоняет контрактные тесты над парой (клиент, сервер).
 ///
 /// `make_pair` возвращает **уже соединённую** пару; вызывается заново для
 /// каждого кейса.
-pub async fn contract_suite<C, S, Fut>(make_pair: impl Fn() -> Fut)
+pub async fn contract_suite<C, S, Fut>(make_pair: impl Fn() -> Fut, initiators: &[Initiator])
 where
     C: Transport + Send,
     S: Transport + Send,
@@ -24,7 +37,9 @@ where
     send_recv_echo(&make_pair).await;
     recv_ends_after_close(&make_pair).await;
     send_after_close_fails(&make_pair).await;
-    mid_transfer_drop_detected(&make_pair).await;
+    for initiator in initiators {
+        mid_transfer_drop_detected(&make_pair, *initiator).await;
+    }
 }
 
 async fn send_recv_echo<C, S, Fut>(make_pair: &impl Fn() -> Fut)
@@ -78,14 +93,24 @@ where
     );
 }
 
-async fn mid_transfer_drop_detected<C, S, Fut>(make_pair: &impl Fn() -> Fut)
+async fn mid_transfer_drop_detected<C, S, Fut>(make_pair: &impl Fn() -> Fut, initiator: Initiator)
 where
     C: Transport + Send,
     S: Transport + Send,
     Fut: Future<Output = (C, S)>,
 {
     let (mut client, mut server) = make_pair().await;
+    if initiator == Initiator::Client {
+        // Клиент шлёт первый байт, чтобы открыть bi-stream: без STREAM-фрейма
+        // серверный `accept_bi` не увидит поток (QUIC).
+        client.send(b"x").await.unwrap();
+    }
     server.send(b"0123456789").await.unwrap();
+    // QUIC-драйвер отправляет STREAM-фреймы асинхронно: `drop` соединения
+    // сразу после `send` может потерять ещё не отправленные данные, и клиент
+    // увидит пустой поток. Даём драйверу время дослать. TLS этого не требует
+    // (данные уже в ядре), но задержка там безвредна.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(server); // резкий обрыв без graceful close
 
     let mut total = Vec::new();

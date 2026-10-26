@@ -37,6 +37,40 @@ impl fmt::Display for ConfigError {
 // содержит raw config. См. ADR-021 «Логи и секреты».
 impl std::error::Error for ConfigError {}
 
+/// Транспорт, выбираемый конфигом: TLS (P4a) или QUIC (P4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    /// TLS (по умолчанию).
+    #[default]
+    Tls,
+    /// QUIC.
+    Quic,
+}
+
+impl std::str::FromStr for TransportKind {
+    type Err = ConfigError;
+
+    /// Парсит `"tls"` / `"quic"` (case-insensitive); env-значение.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tls" => Ok(Self::Tls),
+            "quic" => Ok(Self::Quic),
+            other => Err(ConfigError::Parse(format!(
+                "unknown transport {other:?} (expected \"tls\" or \"quic\")"
+            ))),
+        }
+    }
+}
+
+impl TransportKind {
+    /// Парсит `[server] transport = "tls" | "quic"`; отсутствие поля — [`TransportKind::Tls`].
+    pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
+        let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        Ok(raw.server.transport.unwrap_or_default())
+    }
+}
+
 /// Ошибка адресного правила.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressError {
@@ -69,6 +103,8 @@ struct RawServer {
     address_rules: RawAddressRules,
     #[serde(default)]
     clients: Vec<RawClient>,
+    #[serde(default)]
+    transport: Option<TransportKind>,
 }
 
 #[derive(Deserialize)]
@@ -559,5 +595,22 @@ mod tests {
         .unwrap();
         assert_ne!(ab.config_hash(), a_revoked.config_hash());
         assert_eq!(a_revoked.authorized_len(), 1);
+    }
+
+    #[test]
+    fn transport_kind_from_toml() {
+        assert_eq!(
+            TransportKind::from_toml("").unwrap(),
+            TransportKind::Tls,
+            "пустой конфиг → TLS"
+        );
+        assert_eq!(
+            TransportKind::from_toml("[server]\ntransport = \"tls\"\n").unwrap(),
+            TransportKind::Tls
+        );
+        assert_eq!(
+            TransportKind::from_toml("[server]\ntransport = \"quic\"\n").unwrap(),
+            TransportKind::Quic
+        );
     }
 }

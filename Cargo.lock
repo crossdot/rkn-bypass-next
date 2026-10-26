@@ -132,10 +132,14 @@ dependencies = [
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "config",
  "proxy-core",
+ "quinn",
  "rustls",
  "rustls-pemfile",
  "tokio",
+ "transport-any",
+ "transport-quic",
  "transport-tls",
 ]
 
@@ -728,12 +732,15 @@ dependencies = [
  "config",
  "crypto",
  "proxy-core",
+ "quinn",
  "rustls",
  "rustls-pemfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "transport-any",
+ "transport-quic",
  "transport-tls",
 ]
 
@@ -1040,6 +1047,21 @@ checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "transport-any"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "quinn",
+ "rustls",
+ "rustls-pemfile",
+ "testkit",
+ "tokio",
+ "transport-api",
+ "transport-quic",
+ "transport-tls",
 ]
 
 [[package]]

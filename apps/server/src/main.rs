@@ -1,11 +1,12 @@
-//! TLS-сервер: принимает логические потоки от клиента и открывает
-//! TCP к запрошенному адресу (с mTLS-аутентификацией и адресными правилами).
+//! Сервер: принимает логические потоки от клиента (TLS или QUIC) и открывает
+//! TCP к запрошенному адресу (mTLS + адресные правила).
 //!
-//! Конфигурация через env: `LISTEN_ADDR`, `CERT_PATH`, `KEY_PATH`, `CA_PATH`,
-//! `RULES_PATH`, `CLIENTS_PATH`.
+//! Конфигурация через env: `TRANSPORT` (`tls`|`quic`, дефолт `tls`),
+//! `LISTEN_ADDR`, `CERT_PATH`, `KEY_PATH`, `CA_PATH`, `RULES_PATH`, `CLIENTS_PATH`.
 
 use std::fs::File;
 use std::io::BufReader;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use tokio::net::TcpListener;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use rustls::{RootCertStore, ServerConfig};
+use transport_any::AnyServerTransport;
 use transport_tls::{ensure_crypto_provider, ServerTransport};
 
 fn env_or(name: &str, default: &str) -> String {
@@ -72,6 +74,134 @@ fn load_client_registry() -> config::ClientRegistry {
     }
 }
 
+/// Общий per-connection путь для TLS и QUIC: идентичность → лимит сессий →
+/// проксирование. Транспорт абстрагирован [`AnyServerTransport`], поэтому
+/// mTLS/аудит/`serve_server_connection` не дублируются.
+async fn handle_connection(
+    transport: AnyServerTransport,
+    registry: Arc<config::ClientRegistry>,
+    sessions: Arc<server::SessionManager>,
+    rules: config::AddressRules,
+) {
+    let Some(der) = transport.peer_certificate_der() else {
+        return; // не случится при обязательном mTLS
+    };
+    let fp = crypto::fingerprint(&der);
+    let short = &fp[..12];
+    let max = registry
+        .find_by_fingerprint(&fp)
+        .and_then(|e| e.max_sessions);
+
+    if sessions.try_acquire(&fp, max) {
+        eprintln!("client {short} connected");
+        if let Err(e) =
+            proxy_core::serve_server_connection(transport, proxy_core::CONNECT_TIMEOUT, &rules)
+                .await
+        {
+            eprintln!("client {short} connection error: {e}");
+        }
+        sessions.release(&fp);
+    } else {
+        eprintln!("client {short} session limit reached");
+        drop(transport);
+    }
+}
+
+/// TLS: `TcpListener` + per-connection rustls config с `AuthClientVerifier`
+/// (адрес пира известен из `accept`).
+async fn run_tls(
+    listen_addr: &str,
+    inner: Arc<dyn ClientCertVerifier>,
+    registry: Arc<config::ClientRegistry>,
+    sessions: Arc<server::SessionManager>,
+    rules: config::AddressRules,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(listen_addr).await?;
+    println!("TLS server listening on {listen_addr} (mTLS)");
+
+    loop {
+        let (sock, remote_addr) = listener.accept().await?;
+        let inner = Arc::clone(&inner);
+        let registry = Arc::clone(&registry);
+        let sessions = Arc::clone(&sessions);
+        let rules = rules.clone();
+        let certs = certs.clone();
+        let key = key.clone_key();
+        tokio::spawn(async move {
+            let auth =
+                server::AuthClientVerifier::new(inner, Arc::clone(&registry), Some(remote_addr));
+            let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
+            let tls_config = match ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+            {
+                Ok(c) => Arc::new(c),
+                Err(e) => {
+                    eprintln!("tls config error: {e}");
+                    return;
+                }
+            };
+            match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)).await {
+                Ok(transport) => {
+                    handle_connection(
+                        AnyServerTransport::Tls(transport),
+                        registry,
+                        sessions,
+                        rules,
+                    )
+                    .await;
+                }
+                Err(e) => eprintln!("handshake error: {e}"),
+            }
+        });
+    }
+}
+
+/// QUIC: `quinn::Endpoint::server` + `accept` + `Incoming`. Verifier общий на
+/// Endpoint, `remote_addr` до handshake недоступен → `None` (ADR-022).
+async fn run_quic(
+    listen_addr: &str,
+    inner: Arc<dyn ClientCertVerifier>,
+    registry: Arc<config::ClientRegistry>,
+    sessions: Arc<server::SessionManager>,
+    rules: config::AddressRules,
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = listen_addr.parse()?;
+    let auth = server::AuthClientVerifier::new(inner, Arc::clone(&registry), None);
+    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
+    let rustls_config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
+    let quinn_config = transport_quic::server_config(rustls_config)?;
+    let endpoint = Arc::new(quinn::Endpoint::server(quinn_config, addr)?);
+    println!("QUIC server listening on {listen_addr} (mTLS)");
+
+    loop {
+        let Some(incoming) = endpoint.accept().await else {
+            return Ok(());
+        };
+        let registry = Arc::clone(&registry);
+        let sessions = Arc::clone(&sessions);
+        let rules = rules.clone();
+        let endpoint = Arc::clone(&endpoint);
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => {
+                    let transport = AnyServerTransport::Quic(
+                        transport_quic::QuicServerTransport::new(endpoint, conn),
+                    );
+                    handle_connection(transport, registry, sessions, rules).await;
+                }
+                Err(e) => eprintln!("quic handshake error: {e}"),
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
@@ -86,6 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
+    let kind = match std::env::var("TRANSPORT") {
+        Ok(v) => v.parse::<config::TransportKind>()?,
+        Err(_) => config::TransportKind::Tls,
+    };
     let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:8443");
     let cert_path = env_or(
         "CERT_PATH",
@@ -102,11 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rules = load_address_rules();
     let registry = Arc::new(load_client_registry());
-    println!(
-        "config loaded: fingerprint_count={} config_hash={}",
-        registry.authorized_len(),
-        registry.config_hash()
-    );
+    println!("transport={kind:?}, clients authorized: {}", registry.len());
 
     // mTLS: доверяем CA (dev-ca) для клиентских сертификатов.
     let mut client_roots = RootCertStore::empty();
@@ -121,60 +251,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = load_key(&key_path)?;
 
     let sessions = Arc::new(server::SessionManager::new());
-    let listener = TcpListener::bind(&listen_addr).await?;
-    println!("TLS server listening on {listen_addr} (mTLS)");
-
-    loop {
-        let (sock, remote_addr) = listener.accept().await?;
-        let inner = Arc::clone(&inner);
-        let registry = Arc::clone(&registry);
-        let sessions = Arc::clone(&sessions);
-        let rules = rules.clone();
-        let certs = certs.clone();
-        let key = key.clone_key();
-        tokio::spawn(async move {
-            let auth = server::AuthClientVerifier::new(inner, Arc::clone(&registry), remote_addr);
-            let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
-            let tls_config = match ServerConfig::builder()
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(certs, key)
-            {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    eprintln!("tls config error: {e}");
-                    return;
-                }
-            };
-            match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)).await {
-                Ok(transport) => {
-                    let Some(der) = transport.peer_certificate_der() else {
-                        return; // не случится при обязательном mTLS
-                    };
-                    let fp = crypto::fingerprint(&der);
-                    let short = &fp[..12];
-                    let max = registry
-                        .find_by_fingerprint(&fp)
-                        .and_then(|e| e.max_sessions);
-
-                    if sessions.try_acquire(&fp, max) {
-                        eprintln!("client {short} connected");
-                        if let Err(e) = proxy_core::serve_server_connection(
-                            transport,
-                            proxy_core::CONNECT_TIMEOUT,
-                            &rules,
-                        )
-                        .await
-                        {
-                            eprintln!("client {short} connection error: {e}");
-                        }
-                        sessions.release(&fp);
-                    } else {
-                        eprintln!("client {short} session limit reached");
-                        drop(transport);
-                    }
-                }
-                Err(e) => eprintln!("handshake error: {e}"),
-            }
-        });
+    match kind {
+        config::TransportKind::Tls => {
+            run_tls(&listen_addr, inner, registry, sessions, rules, certs, key).await?;
+        }
+        config::TransportKind::Quic => {
+            run_quic(&listen_addr, inner, registry, sessions, rules, certs, key).await?;
+        }
     }
+    Ok(())
 }

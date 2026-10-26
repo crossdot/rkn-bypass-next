@@ -75,5 +75,9 @@ async fn make_pair() -> (ClientTransport, ServerTransport) {
 #[tokio::test]
 async fn contract() {
     ensure_crypto_provider();
-    testkit::contract_suite(make_pair).await;
+    testkit::contract_suite(
+        make_pair,
+        &[testkit::Initiator::Client, testkit::Initiator::Server],
+    )
+    .await;
 }
