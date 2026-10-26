@@ -6,3 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 transport-api = { path = "../transport-api" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }

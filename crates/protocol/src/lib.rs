@@ -322,4 +322,58 @@ mod tests {
             ProtocolError::PayloadTooLarge { .. }
         ));
     }
+
+    /// Vec-backed in-memory Transport: `send` дописывает в буфер, `recv`
+    /// читает из позиции чтения. `max_chunk` ограничивает число байт за recv,
+    /// чтобы прогонять read_exact-цикл.
+    struct MockTransport {
+        buf: Vec<u8>,
+        read_pos: usize,
+        max_chunk: usize,
+    }
+
+    impl MockTransport {
+        fn chunked(max_chunk: usize) -> Self {
+            Self {
+                buf: Vec::new(),
+                read_pos: 0,
+                max_chunk,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn connect(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn send(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        async fn recv(&mut self, out: &mut [u8]) -> Result<usize, TransportError> {
+            let start = self.read_pos.min(self.buf.len());
+            let avail = &self.buf[start..];
+            let n = avail.len().min(out.len()).min(self.max_chunk);
+            out[..n].copy_from_slice(&avail[..n]);
+            self.read_pos = start + n;
+            Ok(n)
+        }
+
+        async fn close(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_roundtrip() {
+        // max_chunk = 1: recv возвращает по 1 байту, read_exact обязан зациклить.
+        let m = Message::new(MessageKind::Connect, vec![1, 2, 3, 4, 5]);
+        let mut t = MockTransport::chunked(1);
+        write_message(&mut t, &m).await.unwrap();
+        let got = read_message(&mut t).await.unwrap();
+        assert_eq!(got, m);
+    }
 }
