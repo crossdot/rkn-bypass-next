@@ -35,6 +35,10 @@ python3 -m http.server "$HTTP_PORT" --bind 0.0.0.0 >"$TMP/http.log" 2>&1 &
 PIDS+=($!)
 sleep 0.5
 
+# Логи с цветом могут прийти от сторонних сборок: сравнение не должно зависеть
+# от ANSI-последовательностей.
+strip_ansi() { sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1"; }
+
 run_case() {
   local label="$1" server_transport="$2" client_transport="$3" server_port="$4"
   local expect_log="${5:-}"
@@ -81,12 +85,12 @@ run_case() {
     return 1
   fi
   if [[ -n "$expect_log" ]]; then
-    if ! grep -q -- "$expect_log" "$TMP/client-$tag.log"; then
+    if ! strip_ansi "$TMP/client-$tag.log" | grep -q -- "$expect_log"; then
       echo "expected client log to contain: $expect_log"
       echo "--- client log ---"; cat "$TMP/client-$tag.log"
       return 1
     fi
-    echo "client log: $(grep -o 'event=transport_selected.*' "$TMP/client-$tag.log" | tail -1)"
+    echo "client log: $(strip_ansi "$TMP/client-$tag.log" | grep -o 'event=transport_selected.*' | tail -1)"
   fi
   CLIENT_ENV=""
 }

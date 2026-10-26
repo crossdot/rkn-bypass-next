@@ -6,7 +6,7 @@
 //! `KEY_PATH`, `CA_PATH`, `RULES_PATH`, `CLIENTS_PATH`.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, IsTerminal};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -196,6 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        // key=value должно быть машинно-читаемым в файлах/journalctl/CI:
+        // цвет только на терминале (ADR-021/ADR-023).
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let strategy = match std::env::var("TRANSPORT") {

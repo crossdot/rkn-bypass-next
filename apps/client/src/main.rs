@@ -12,7 +12,7 @@
 //! (см. ADR-023).
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, IsTerminal};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        // key=value должно быть машинно-читаемым в файлах/journalctl/CI:
+        // цвет только на терминале (ADR-021/ADR-023).
+        .with_ansi(std::io::stderr().is_terminal())
         .init();
 
     let policy = config::TransportPolicy::from_env()?;
