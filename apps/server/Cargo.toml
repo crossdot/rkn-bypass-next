@@ -17,6 +17,7 @@ transport-tls = { path = "../../crates/transport-tls" }
 proxy-core = { path = "../../crates/proxy-core" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tracing-test = { workspace = true }

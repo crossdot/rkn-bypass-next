@@ -7,6 +7,10 @@ rust-version.workspace = true
 [dependencies]
 transport-api = { path = "../transport-api" }
 rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 rustls-pemfile = { workspace = true }
+tokio = { workspace = true }

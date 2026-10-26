@@ -1,29 +1,35 @@
 //! Абстракция транспорта: трейт [`Transport`] и типы ошибок.
 //!
-//! Никакой реализации и никаких зависимостей на tokio или TLS-библиотеки.
+//! Контракт асинхронный (tokio), но без прямой зависимости на tokio или
+//! TLS-библиотеки: только [`async_trait`] для object-safety и `Send`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use async_trait::async_trait;
 use std::fmt;
 
-/// Трейт сетевого транспорта.
+/// Трейт сетевого транспорта (асинхронный).
 ///
-/// Определяет минимальный синхронный контракт передачи байтов.
+/// Определяет минимальный контракт передачи байтов поверх tokio.
 /// Все методы принимают `&mut self`: транспорт владеет состоянием соединения.
+///
+/// `#[async_trait]` даёт object-safety и `Send` для `tokio::spawn`
+/// (ADR-017: `Box<dyn Transport>` для диспетчеризации по конфигу).
+#[async_trait]
 pub trait Transport {
     /// Устанавливает соединение с удалённой точкой.
-    fn connect(&mut self) -> Result<(), TransportError>;
+    async fn connect(&mut self) -> Result<(), TransportError>;
 
     /// Отправляет байты. Возвращает количество фактически записанных байт.
-    fn send(&mut self, data: &[u8]) -> Result<usize, TransportError>;
+    async fn send(&mut self, data: &[u8]) -> Result<usize, TransportError>;
 
     /// Принимает байты в `buf`. Возвращает количество прочитанных байт;
     /// `0` означает конец потока (EOF).
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError>;
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError>;
 
     /// Закрывает соединение и освобождает ресурсы.
-    fn close(&mut self) -> Result<(), TransportError>;
+    async fn close(&mut self) -> Result<(), TransportError>;
 }
 
 /// Ошибка транспортного уровня.

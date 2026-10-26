@@ -1,6 +1,6 @@
 # ADR-017: Синхронный контракт Transport в MVP
 
-## Статус: Принято
+## Статус: Superseded — Phase 2 активирована (P4a async-рефакторинг)
 
 ## Контекст
 `transport-api` уже содержит синхронный трейт `Transport`
@@ -30,3 +30,19 @@ sync достаточно.
 - Phase 2 включает рефакторинг `Transport` и серверного/клиентского
   цикла; sync-версия остаётся как эталон для проверки корректности.
 - ADR-017 не отменяет и не меняет ADR-011/012/013/016.
+
+## Phase 2 активирована (P4a)
+- Ветка `p4a-async` (2026-10-26): `Transport` → async (tokio); `transport-tls`
+  → `tokio-rustls`; `proxy-core` + `apps/{client,server,diag-cli}` → tokio
+  (task-per-connection). Затронуты: `transport-api`, `transport-tls`, `socks5`,
+  `protocol`, `proxy-core`.
+- Object-safety: `Box<dyn Transport>` + `async_trait` (даёт object-safety и
+  `Send` для `tokio::spawn`). Per-call Box-аллокация принята для MVP;
+  enum-диспетчеризация — Phase 2-оптимизация, если профайлинг relay покажет
+  overhead.
+- `tokio-rustls` зафиксирован на `ring` (`default-features = false`,
+  `features = ["ring", "tls12"]`) — иначе по умолчанию тянется `aws-lc-rs`
+  (cmake + C-компилятор, тяжёлый криптопровайдер).
+- `proxy-core::relay` — generic `T: Transport`; `map_connect_error` маппит
+  `tokio::time::error::Elapsed → 0x04` (host unreachable, ADR-020).
+- Sync-версия остаётся в git-истории как эталон корректности.

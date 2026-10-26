@@ -6,10 +6,10 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
+
+use tokio::net::TcpListener;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
@@ -72,7 +72,8 @@ fn load_client_registry() -> config::ClientRegistry {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
     // Аудит-логи: компактный key=value на stderr; уровень по умолчанию info
     // (переопределяется RUST_LOG). См. ADR-021 «Аудит handshake'ей».
@@ -120,21 +121,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = load_key(&key_path)?;
 
     let sessions = Arc::new(server::SessionManager::new());
-    let listener = TcpListener::bind(&listen_addr)?;
+    let listener = TcpListener::bind(&listen_addr).await?;
     println!("TLS server listening on {listen_addr} (mTLS)");
 
-    for stream in listener.incoming() {
-        let sock = stream?;
-        let remote_addr = sock
-            .peer_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    loop {
+        let (sock, remote_addr) = listener.accept().await?;
         let inner = Arc::clone(&inner);
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
         let rules = rules.clone();
         let certs = certs.clone();
         let key = key.clone_key();
-        thread::spawn(move || {
+        tokio::spawn(async move {
             let auth = server::AuthClientVerifier::new(inner, Arc::clone(&registry), remote_addr);
             let verifier: Arc<dyn ClientCertVerifier> = Arc::new(auth);
             let tls_config = match ServerConfig::builder()
@@ -147,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)) {
+            match ServerTransport::accept(sock, tls_config, Duration::from_secs(10)).await {
                 Ok(transport) => {
                     let Some(der) = transport.peer_certificate_der() else {
                         return; // не случится при обязательном mTLS
@@ -164,7 +162,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             transport,
                             proxy_core::CONNECT_TIMEOUT,
                             &rules,
-                        ) {
+                        )
+                        .await
+                        {
                             eprintln!("client {short} connection error: {e}");
                         }
                         sessions.release(&fp);
@@ -177,5 +177,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    Ok(())
 }

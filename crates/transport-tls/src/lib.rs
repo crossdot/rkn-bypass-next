@@ -1,18 +1,21 @@
-//! TLS-транспорт на `rustls` — первая реализация [`Transport`].
+//! TLS-транспорт на `rustls` — реализация [`Transport`] поверх tokio.
 //!
-//! Синхронный: блокирующий ввод-вывод поверх [`std::net::TcpStream`] и
-//! `rustls::StreamOwned`. Не знает о профиле, Fallbacks, nginx, домене,
-//! `mode` и `entry`; сертификаты передаются снаружи через конфиг rustls.
+//! Асинхронный: `tokio::net::TcpStream` + `tokio-rustls`. Не знает о профиле,
+//! Fallbacks, nginx, домене, `mode` и `entry`; сертификаты передаются снаружи
+//! через конфиг rustls.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 use std::time::Duration;
 
-use rustls::{ClientConnection, ServerConnection, StreamOwned};
+use async_trait::async_trait;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 pub use transport_api::{Transport, TransportError};
 
@@ -27,14 +30,14 @@ pub fn ensure_crypto_provider() {
 /// Клиентский TLS-транспорт.
 ///
 /// [`Transport::connect`] устанавливает TCP-соединение и выполняет
-/// TLS-handshake с таймаутом.
+/// TLS-handshake с таймаутами.
 pub struct ClientTransport {
     addr: SocketAddr,
     server_name: rustls::pki_types::ServerName<'static>,
     config: Arc<rustls::ClientConfig>,
     connect_timeout: Duration,
     handshake_timeout: Duration,
-    stream: Option<StreamOwned<ClientConnection, TcpStream>>,
+    stream: Option<ClientTlsStream<TcpStream>>,
 }
 
 impl ClientTransport {
@@ -59,94 +62,57 @@ impl ClientTransport {
             stream: None,
         })
     }
-
-    /// Устанавливает таймаут чтения на подлежащий сокет.
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        match self.stream.as_ref() {
-            Some(stream) => stream.sock.set_read_timeout(timeout),
-            None => Ok(()),
-        }
-    }
 }
 
+#[async_trait]
 impl Transport for ClientTransport {
-    fn connect(&mut self) -> Result<(), TransportError> {
+    async fn connect(&mut self) -> Result<(), TransportError> {
         ensure_crypto_provider();
-        let sock = TcpStream::connect_timeout(&self.addr, self.connect_timeout).map_err(|e| {
-            TransportError::ConnectFailed(format!("tcp connect to {}: {e}", self.addr))
-        })?;
-        sock.set_read_timeout(Some(self.handshake_timeout))
-            .map_err(|e| TransportError::ConnectFailed(format!("set read timeout: {e}")))?;
-        sock.set_write_timeout(Some(self.handshake_timeout))
-            .map_err(|e| TransportError::ConnectFailed(format!("set write timeout: {e}")))?;
-
-        let conn = ClientConnection::new(Arc::clone(&self.config), self.server_name.clone())
-            .map_err(|e| TransportError::ConnectFailed(format!("tls init: {e}")))?;
-        let mut stream = StreamOwned::new(conn, sock);
-
-        while stream.conn.is_handshaking() {
-            stream
-                .conn
-                .complete_io(&mut stream.sock)
-                .map_err(|e| TransportError::ConnectFailed(format!("tls handshake: {e}")))?;
-        }
-
-        // Handshake прошёл — снимаем таймаут, дальше обычная блокирующая передача.
-        let _ = stream.sock.set_read_timeout(None);
-        let _ = stream.sock.set_write_timeout(None);
+        let sock = tokio::time::timeout(self.connect_timeout, TcpStream::connect(self.addr))
+            .await
+            .map_err(|_| {
+                TransportError::ConnectFailed(format!("tcp connect to {}: timeout", self.addr))
+            })?
+            .map_err(|e| {
+                TransportError::ConnectFailed(format!("tcp connect to {}: {e}", self.addr))
+            })?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.config));
+        let stream = tokio::time::timeout(
+            self.handshake_timeout,
+            connector.connect(self.server_name.clone(), sock),
+        )
+        .await
+        .map_err(|_| TransportError::ConnectFailed("tls handshake timeout".to_string()))?
+        .map_err(|e| TransportError::ConnectFailed(format!("tls handshake: {e}")))?;
         self.stream = Some(stream);
         Ok(())
     }
 
-    fn send(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+    async fn send(&mut self, data: &[u8]) -> Result<usize, TransportError> {
         self.stream
             .as_mut()
             .ok_or(TransportError::NotConnected)?
             .write_all(data)
+            .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
         Ok(data.len())
     }
 
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         self.stream
             .as_mut()
             .ok_or(TransportError::NotConnected)?
             .read(buf)
+            .await
             .map_err(|e| TransportError::RecvFailed(e.to_string()))
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    async fn close(&mut self) -> Result<(), TransportError> {
         let Some(mut stream) = self.stream.take() else {
             return Ok(());
         };
-        stream.conn.send_close_notify();
-        let _ = stream.conn.complete_io(&mut stream.sock);
+        let _ = stream.shutdown().await;
         Ok(())
-    }
-}
-
-impl Read for ClientTransport {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.stream.as_mut() {
-            Some(stream) => stream.read(buf),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "not connected")),
-        }
-    }
-}
-
-impl Write for ClientTransport {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.stream.as_mut() {
-            Some(stream) => stream.write(buf),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "not connected")),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self.stream.as_mut() {
-            Some(stream) => stream.flush(),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "not connected")),
-        }
     }
 }
 
@@ -155,91 +121,60 @@ impl Write for ClientTransport {
 /// TLS-сессия устанавливается в [`ServerTransport::accept`]; после этого
 /// [`Transport::connect`] — no-op (сессия уже активна).
 pub struct ServerTransport {
-    stream: StreamOwned<ServerConnection, TcpStream>,
+    stream: ServerTlsStream<TcpStream>,
 }
 
 impl ServerTransport {
     /// Принимает TLS-сессию поверх уже принятого TCP-соединения.
-    pub fn accept(
+    pub async fn accept(
         sock: TcpStream,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: Duration,
     ) -> Result<Self, TransportError> {
         ensure_crypto_provider();
-        sock.set_read_timeout(Some(handshake_timeout))
-            .map_err(|e| TransportError::ConnectFailed(format!("set read timeout: {e}")))?;
-        sock.set_write_timeout(Some(handshake_timeout))
-            .map_err(|e| TransportError::ConnectFailed(format!("set write timeout: {e}")))?;
-
-        let conn = ServerConnection::new(config)
-            .map_err(|e| TransportError::ConnectFailed(format!("tls init: {e}")))?;
-        let mut stream = StreamOwned::new(conn, sock);
-
-        while stream.conn.is_handshaking() {
-            stream
-                .conn
-                .complete_io(&mut stream.sock)
-                .map_err(|e| TransportError::ConnectFailed(format!("tls handshake: {e}")))?;
-        }
-
-        let _ = stream.sock.set_read_timeout(None);
-        let _ = stream.sock.set_write_timeout(None);
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let stream = tokio::time::timeout(handshake_timeout, acceptor.accept(sock))
+            .await
+            .map_err(|_| TransportError::ConnectFailed("tls handshake timeout".to_string()))?
+            .map_err(|e| TransportError::ConnectFailed(format!("tls handshake: {e}")))?;
         Ok(Self { stream })
-    }
-
-    /// Устанавливает таймаут чтения на подлежащий сокет.
-    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.sock.set_read_timeout(timeout)
     }
 
     /// DER-сертификат клиента (после handshake), если предъявлен.
     pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
         self.stream
-            .conn
+            .get_ref()
+            .1
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|c| c.as_ref().to_vec())
     }
 }
 
+#[async_trait]
 impl Transport for ServerTransport {
-    fn connect(&mut self) -> Result<(), TransportError> {
+    async fn connect(&mut self) -> Result<(), TransportError> {
         // Серверная сессия уже установлена в accept().
         Ok(())
     }
 
-    fn send(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+    async fn send(&mut self, data: &[u8]) -> Result<usize, TransportError> {
         self.stream
             .write_all(data)
+            .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
         Ok(data.len())
     }
 
-    fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         self.stream
             .read(buf)
+            .await
             .map_err(|e| TransportError::RecvFailed(e.to_string()))
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
-        self.stream.conn.send_close_notify();
-        let _ = self.stream.conn.complete_io(&mut self.stream.sock);
+    async fn close(&mut self) -> Result<(), TransportError> {
+        let _ = self.stream.shutdown().await;
         Ok(())
-    }
-}
-
-impl Read for ServerTransport {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl Write for ServerTransport {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
     }
 }

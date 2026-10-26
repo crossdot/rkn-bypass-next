@@ -20,9 +20,9 @@ fn captured_lines() -> Vec<String> {
         .collect()
 }
 
-#[test]
+#[tokio::test]
 #[traced_test]
-fn audit_ok_event() {
+async fn audit_ok_event() {
     ensure_crypto_provider();
     let a = gen_client("alice");
     let fp = a.fingerprint.clone();
@@ -31,7 +31,7 @@ fn audit_ok_event() {
         a.cert_pem.clone(),
         false,
     )]));
-    assert!(handshake_ok(registry, build_client_config(&a)));
+    assert!(handshake_ok(registry, build_client_config(&a)).await);
 
     let needle = format!("fingerprint=sha256:{fp}");
     let lines = captured_lines();
@@ -46,14 +46,14 @@ fn audit_ok_event() {
     assert!(e.contains("remote_addr=127.0.0.1:"), "{e}");
 }
 
-#[test]
+#[tokio::test]
 #[traced_test]
-fn audit_unknown_fingerprint() {
+async fn audit_unknown_fingerprint() {
     ensure_crypto_provider();
     let a = gen_client("alice");
     let fp = a.fingerprint.clone();
     let registry = Arc::new(config::ClientRegistry::default());
-    assert!(!handshake_ok(registry, build_client_config(&a)));
+    assert!(!handshake_ok(registry, build_client_config(&a)).await);
 
     let needle = format!("fingerprint=sha256:{fp}");
     let lines = captured_lines();
@@ -68,14 +68,14 @@ fn audit_unknown_fingerprint() {
     assert!(e.contains("remote_addr=127.0.0.1:"), "{e}");
 }
 
-#[test]
+#[tokio::test]
 #[traced_test]
-fn audit_revoked_with_client_id() {
+async fn audit_revoked_with_client_id() {
     ensure_crypto_provider();
     let a = gen_client("alice");
     let fp = a.fingerprint.clone();
     let registry = Arc::new(registry_with(&[("alice".into(), a.cert_pem.clone(), true)]));
-    assert!(!handshake_ok(registry, build_client_config(&a)));
+    assert!(!handshake_ok(registry, build_client_config(&a)).await);
 
     let needle = format!("fingerprint=sha256:{fp}");
     let lines = captured_lines();
@@ -90,9 +90,9 @@ fn audit_revoked_with_client_id() {
     assert!(e.contains("client_id=alice"), "{e}");
 }
 
-#[test]
+#[tokio::test]
 #[traced_test]
-fn audit_never_logs_pem() {
+async fn audit_never_logs_pem() {
     ensure_crypto_provider();
     let a = gen_client("alice");
     let b = gen_client("bob");
@@ -103,11 +103,11 @@ fn audit_never_logs_pem() {
         a.cert_pem.clone(),
         false,
     )]));
-    assert!(handshake_ok(ok, build_client_config(&a)));
+    assert!(handshake_ok(ok, build_client_config(&a)).await);
     let unknown = Arc::new(config::ClientRegistry::default());
-    assert!(!handshake_ok(unknown, build_client_config(&b)));
+    assert!(!handshake_ok(unknown, build_client_config(&b)).await);
     let revoked = Arc::new(registry_with(&[("alice".into(), a.cert_pem.clone(), true)]));
-    assert!(!handshake_ok(revoked, build_client_config(&a)));
+    assert!(!handshake_ok(revoked, build_client_config(&a)).await);
 
     for line in captured_lines() {
         assert!(!line.contains("-----BEGIN"), "PEM leak: {line}");

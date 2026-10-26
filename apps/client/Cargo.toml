@@ -13,3 +13,4 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 transport-tls = { path = "../../crates/transport-tls" }
 proxy-core = { path = "../../crates/proxy-core" }
+tokio = { workspace = true }

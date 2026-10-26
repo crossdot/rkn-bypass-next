@@ -2,13 +2,13 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio::net::TcpListener;
 use transport_tls::{
     ensure_crypto_provider, ClientTransport, ServerTransport, Transport, TransportError,
 };
@@ -53,35 +53,37 @@ fn load_client_config(trust_server: bool) -> Arc<ClientConfig> {
     )
 }
 
-fn bind() -> (TcpListener, SocketAddr) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+async fn bind() -> (TcpListener, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     (listener, addr)
 }
 
 /// Читает ровно `len` байт через [`Transport::recv`].
-fn recv_exact(t: &mut impl Transport, len: usize) -> Vec<u8> {
+async fn recv_exact(t: &mut impl Transport, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut filled = 0;
     while filled < len {
-        let n = t.recv(&mut out[filled..]).expect("recv");
+        let n = t.recv(&mut out[filled..]).await.expect("recv");
         assert!(n > 0, "unexpected EOF");
         filled += n;
     }
     out
 }
 
-#[test]
-fn round_trip_echo() {
+#[tokio::test]
+async fn round_trip_echo() {
     ensure_crypto_provider();
-    let (listener, addr) = bind();
+    let (listener, addr) = bind().await;
     let server_cfg = load_server_config();
-    let server = thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
-        let mut t = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5)).unwrap();
-        let got = recv_exact(&mut t, 5);
-        t.send(&got).unwrap();
-        t.close().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut t = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let got = recv_exact(&mut t, 5).await;
+        t.send(&got).await.unwrap();
+        t.close().await.unwrap();
     });
 
     let mut t = ClientTransport::new(
@@ -92,22 +94,22 @@ fn round_trip_echo() {
         Duration::from_secs(5),
     )
     .unwrap();
-    t.connect().unwrap();
-    assert_eq!(t.send(b"hello").unwrap(), 5);
-    assert_eq!(recv_exact(&mut t, 5), b"hello");
-    t.close().unwrap();
-    server.join().unwrap();
+    t.connect().await.unwrap();
+    assert_eq!(t.send(b"hello").await.unwrap(), 5);
+    assert_eq!(recv_exact(&mut t, 5).await, b"hello");
+    t.close().await.unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn bad_certificate_rejected() {
+#[tokio::test]
+async fn bad_certificate_rejected() {
     ensure_crypto_provider();
-    let (listener, addr) = bind();
+    let (listener, addr) = bind().await;
     let server_cfg = load_server_config();
-    let server = thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
         // Клиент оборвёт handshake после отклонения сертификата.
-        let _ = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5));
+        let _ = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5)).await;
     });
 
     let mut t = ClientTransport::new(
@@ -118,19 +120,19 @@ fn bad_certificate_rejected() {
         Duration::from_secs(5),
     )
     .unwrap();
-    let res = t.connect();
+    let res = t.connect().await;
     assert!(matches!(res, Err(TransportError::ConnectFailed(_))));
-    server.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn handshake_timeout() {
+#[tokio::test]
+async fn handshake_timeout() {
     ensure_crypto_provider();
-    let (listener, addr) = bind();
-    let server = thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+    let (listener, addr) = bind().await;
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
         // Держим сокет, но не делаем TLS: клиент не дождётся ServerHello.
-        thread::sleep(Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         drop(sock);
     });
 
@@ -143,22 +145,24 @@ fn handshake_timeout() {
     )
     .unwrap();
     let start = Instant::now();
-    let res = t.connect();
+    let res = t.connect().await;
     assert!(res.is_err());
     assert!(start.elapsed() >= Duration::from_millis(400));
-    server.join().unwrap();
+    server.await.unwrap();
 }
 
-#[test]
-fn drop_mid_transfer_detected() {
+#[tokio::test]
+async fn drop_mid_transfer_detected() {
     ensure_crypto_provider();
-    let (listener, addr) = bind();
+    let (listener, addr) = bind().await;
     let server_cfg = load_server_config();
-    let server = thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
-        let mut t = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5)).unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut t = ServerTransport::accept(sock, server_cfg, Duration::from_secs(5))
+            .await
+            .unwrap();
         // Отправляем данные и резко обрываем соединение без close_notify.
-        t.send(b"0123456789").unwrap();
+        t.send(b"0123456789").await.unwrap();
         drop(t);
     });
 
@@ -170,12 +174,12 @@ fn drop_mid_transfer_detected() {
         Duration::from_secs(5),
     )
     .unwrap();
-    t.connect().unwrap();
+    t.connect().await.unwrap();
 
     let mut total = Vec::new();
     let mut buf = [0u8; 64];
     let terminated = loop {
-        match t.recv(&mut buf) {
+        match t.recv(&mut buf).await {
             Ok(0) => break Ok(()),
             Ok(n) => total.extend_from_slice(&buf[..n]),
             Err(e) => break Err(e),
@@ -184,5 +188,5 @@ fn drop_mid_transfer_detected() {
 
     assert_eq!(total, b"0123456789");
     assert!(matches!(terminated, Ok(()) | Err(_)));
-    server.join().unwrap();
+    server.await.unwrap();
 }

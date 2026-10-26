@@ -1,10 +1,11 @@
 //! Общие хелперы интеграционных тестов mTLS (server + client).
 
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
+
+use tokio::net::TcpListener;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -99,16 +100,18 @@ pub fn build_client_config(client: &crypto::GeneratedClient) -> Arc<ClientConfig
 
 /// Прогоняет TLS-хендшейк с реальным remote_addr (как в main.rs) и
 /// возвращает, успешен ли он с обеих сторон.
-pub fn handshake_ok(
+pub async fn handshake_ok(
     registry: Arc<config::ClientRegistry>,
     client_config: Arc<ClientConfig>,
 ) -> bool {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (sock, peer) = listener.accept().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, peer) = listener.accept().await.unwrap();
         let server_config = build_server_config(registry, peer);
-        ServerTransport::accept(sock, server_config, Duration::from_secs(5)).is_ok()
+        ServerTransport::accept(sock, server_config, Duration::from_secs(5))
+            .await
+            .is_ok()
     });
     let mut client = ClientTransport::new(
         addr,
@@ -118,6 +121,6 @@ pub fn handshake_ok(
         Duration::from_secs(5),
     )
     .unwrap();
-    let client_ok = client.connect().is_ok();
-    client_ok && server.join().unwrap()
+    let client_ok = client.connect().await.is_ok();
+    client_ok && server.await.unwrap()
 }

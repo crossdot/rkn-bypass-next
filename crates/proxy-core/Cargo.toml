@@ -8,7 +8,8 @@ rust-version.workspace = true
 socks5 = { path = "../socks5" }
 protocol = { path = "../protocol" }
 config = { path = "../config" }
-transport-tls = { path = "../transport-tls" }
+transport-api = { path = "../transport-api" }
+tokio = { workspace = true }
 
 [dev-dependencies]
 transport-tls = { path = "../transport-tls" }
@@ -17,3 +18,4 @@ protocol = { path = "../protocol" }
 config = { path = "../config" }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio = { workspace = true }

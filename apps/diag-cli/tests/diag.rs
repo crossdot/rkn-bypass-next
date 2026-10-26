@@ -2,13 +2,13 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use tokio::net::TcpListener;
 use transport_tls::ServerTransport;
 
 const CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-server.crt");
@@ -47,30 +47,32 @@ fn host_ipv4() -> Ipv4Addr {
 }
 
 /// TLS-сервер, обслуживающий одно соединение с permissive-правилами.
-fn spawn_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+async fn spawn_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = load_server_config();
-    thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
-        let server = ServerTransport::accept(sock, config, Duration::from_secs(5)).unwrap();
+    tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let server = ServerTransport::accept(sock, config, Duration::from_secs(5))
+            .await
+            .unwrap();
         let rules = config::AddressRules::from_toml(
             r#"[server.address_rules]
             allow_cidrs = ["0.0.0.0/0"]"#,
         )
         .unwrap();
-        let _ = proxy_core::serve_server_connection(server, Duration::from_secs(3), &rules);
+        let _ = proxy_core::serve_server_connection(server, Duration::from_secs(3), &rules).await;
     });
     addr
 }
 
-#[test]
-fn diag_check_unreachable_host_reports_class() {
-    let server_addr = spawn_server();
+#[tokio::test]
+async fn diag_check_unreachable_host_reports_class() {
+    let server_addr = spawn_server().await;
 
     // Закрытый порт на host IP → connection refused.
     let host = host_ipv4();
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(host), 0)).unwrap();
+    let listener = std::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(host), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
@@ -79,7 +81,7 @@ fn diag_check_unreachable_host_reports_class() {
         port,
     };
 
-    let stages = diag_cli::run_check(server_addr, &target);
+    let stages = diag_cli::run_check(server_addr, &target).await;
 
     assert_eq!(stages.len(), 4);
     assert_eq!(stages[0].name, "connect");

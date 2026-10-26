@@ -1,18 +1,21 @@
 //! SOCKS5-режим: handshake, двунаправленный relay и логические потоки.
 //!
-//! Thread-per-connection (ADR-017). Использует [`socks5`] для парсинга,
-//! [`protocol`] для прикладного протокола клиент↔сервер и
-//! [`transport_tls`] для транспорта.
+//! Асинхронный (tokio, task-per-connection). Использует [`socks5`] для парсинга,
+//! [`protocol`] для прикладного протокола клиент↔сервер и generic [`Transport`]
+//! для транспорта (расцеплен от `transport-tls`).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::fmt;
-use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use transport_tls::{ClientTransport, ServerTransport, Transport};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use transport_api::{Transport, TransportError};
 
 /// Интервал опроса relay-цикла (таймаут чтения на обеих сторонах).
 pub const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -31,7 +34,7 @@ pub enum ProxyError {
     /// Ошибка прикладного протокола.
     Protocol(protocol::ProtocolError),
     /// Ошибка транспорта.
-    Transport(transport_tls::TransportError),
+    Transport(TransportError),
     /// Ошибка ввода-вывода.
     Io(std::io::Error),
     /// Команда распознана, но не поддерживается (BIND/UDP ASSOCIATE).
@@ -40,8 +43,6 @@ pub enum ProxyError {
     NoAcceptableMethod,
     /// Прикладное сообщение имеет неожиданный тип (ожидался `Connect`).
     UnexpectedMessage(protocol::MessageKind),
-    /// Истёк таймаут ожидания `ConnectAck` от сервера.
-    ConnectAckTimeout,
     /// Некорректный `ConnectAck` (битый payload).
     BadConnectAck,
 }
@@ -56,7 +57,6 @@ impl fmt::Display for ProxyError {
             Self::CommandNotSupported(c) => write!(f, "command not supported: {c:?}"),
             Self::NoAcceptableMethod => write!(f, "no acceptable authentication method"),
             Self::UnexpectedMessage(k) => write!(f, "unexpected protocol message kind: {k:?}"),
-            Self::ConnectAckTimeout => write!(f, "timed out waiting for ConnectAck"),
             Self::BadConnectAck => write!(f, "malformed ConnectAck"),
         }
     }
@@ -86,8 +86,8 @@ impl From<protocol::ProtocolError> for ProxyError {
     }
 }
 
-impl From<transport_tls::TransportError> for ProxyError {
-    fn from(e: transport_tls::TransportError) -> Self {
+impl From<TransportError> for ProxyError {
+    fn from(e: TransportError) -> Self {
         Self::Transport(e)
     }
 }
@@ -103,43 +103,49 @@ impl From<std::io::Error> for ProxyError {
 /// Метод — только NO AUTH. Отклоняет BIND и UDP ASSOCIATE ответом
 /// [`socks5::REP_COMMAND_NOTSUPPORTED`]; неверная версия или отсутствие
 /// приемлемого метода — ошибка без положительного ответа.
-pub fn handshake<S: Read + Write>(stream: &mut S) -> Result<socks5::Target, ProxyError> {
-    let greeting = socks5::read_greeting(stream)?;
+pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<socks5::Target, ProxyError> {
+    let greeting = socks5::read_greeting(stream).await?;
     if greeting.methods.contains(&socks5::AUTH_NONE) {
-        socks5::write_method_selection(stream, socks5::AUTH_NONE)?;
+        socks5::write_method_selection(stream, socks5::AUTH_NONE).await?;
     } else {
-        socks5::write_method_selection(stream, socks5::AUTH_NO_ACCEPTABLE)?;
+        socks5::write_method_selection(stream, socks5::AUTH_NO_ACCEPTABLE).await?;
         return Err(ProxyError::NoAcceptableMethod);
     }
 
-    let request = socks5::read_request(stream)?;
+    let request = socks5::read_request(stream).await?;
     if request.command != socks5::Command::Connect {
         socks5::write_reply(
             stream,
             socks5::REP_COMMAND_NOT_SUPPORTED,
             &socks5::Addr::IPv4([0, 0, 0, 0]),
             0,
-        )?;
+        )
+        .await?;
         return Err(ProxyError::CommandNotSupported(request.command));
     }
     Ok(request.target)
 }
 
 /// Отправляет цель CONNECT по прикладному протоколу (клиент → сервер).
-pub fn write_connect_target<W: Write>(
-    writer: &mut W,
+pub async fn write_connect_target<T: Transport + ?Sized>(
+    transport: &mut T,
     target: &socks5::Target,
 ) -> Result<(), ProxyError> {
     protocol::write_message(
-        writer,
+        transport,
         &protocol::Message::new(protocol::MessageKind::Connect, target.encode()),
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Читает цель CONNECT из прикладного протокола (на стороне сервера).
-pub fn read_connect_target<R: Read>(reader: &mut R) -> Result<socks5::Target, ProxyError> {
-    let message = protocol::read_message(reader)?;
+pub async fn read_connect_target<T: Transport + ?Sized>(
+    transport: &mut T,
+) -> Result<socks5::Target, ProxyError> {
+    let message = protocol::read_message(transport).await?;
     if message.kind != protocol::MessageKind::Connect {
         return Err(ProxyError::UnexpectedMessage(message.kind));
     }
@@ -150,74 +156,67 @@ pub fn read_connect_target<R: Read>(reader: &mut R) -> Result<socks5::Target, Pr
 /// Отправляет `ConnectAck` по прикладному протоколу (сервер → клиент).
 ///
 /// Payload — один байт REP-кода: `0x00` = успех, иначе код ошибки.
-pub fn write_connect_ack<W: Write>(writer: &mut W, rep_code: u8) -> Result<(), ProxyError> {
+pub async fn write_connect_ack<T: Transport + ?Sized>(
+    transport: &mut T,
+    rep_code: u8,
+) -> Result<(), ProxyError> {
     protocol::write_message(
-        writer,
+        transport,
         &protocol::Message::new(protocol::MessageKind::ConnectAck, vec![rep_code]),
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Читает `ConnectAck` и возвращает REP-код (`0x00` = успех).
 ///
-/// Отличает таймаут чтения ([`ProxyError::ConnectAckTimeout`]) от битого
-/// payload ([`ProxyError::BadConnectAck`]).
-pub fn read_connect_ack<R: Read>(reader: &mut R) -> Result<u8, ProxyError> {
-    let mut header = [0u8; protocol::HEADER_LEN];
-    if let Err(e) = reader.read_exact(&mut header) {
-        return Err(if is_retryable(&e) {
-            ProxyError::ConnectAckTimeout
-        } else {
-            ProxyError::Io(e)
-        });
+/// Битый payload (неверный kind или длина) → [`ProxyError`]. Таймаут задаётся
+/// вызывающей стороной через `tokio::time::timeout`.
+pub async fn read_connect_ack<T: Transport + ?Sized>(transport: &mut T) -> Result<u8, ProxyError> {
+    let message = protocol::read_message(transport).await?;
+    if message.kind != protocol::MessageKind::ConnectAck {
+        return Err(ProxyError::UnexpectedMessage(message.kind));
     }
-
-    if header[0] != protocol::VERSION {
-        return Err(ProxyError::Protocol(
-            protocol::ProtocolError::UnsupportedVersion {
-                got: header[0],
-                supported: protocol::VERSION,
-            },
-        ));
-    }
-
-    let kind = protocol::MessageKind::from_u8(header[1])?;
-    if kind != protocol::MessageKind::ConnectAck {
-        return Err(ProxyError::UnexpectedMessage(kind));
-    }
-
-    let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
-    if len != 1 {
+    if message.payload.len() != 1 {
         return Err(ProxyError::BadConnectAck);
     }
-
-    let mut payload = [0u8; 1];
-    reader.read_exact(&mut payload).map_err(ProxyError::Io)?;
-    Ok(payload[0])
+    Ok(message.payload[0])
 }
 
-/// Сопоставляет ошибку TCP-connect с SOCKS5 REP-кодом.
-fn map_connect_error(e: &io::Error) -> u8 {
-    match e.kind() {
-        io::ErrorKind::ConnectionRefused => socks5::REP_CONNECTION_REFUSED,
-        io::ErrorKind::NetworkUnreachable => socks5::REP_NETWORK_UNREACHABLE,
-        io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => socks5::REP_HOST_UNREACHABLE,
-        _ => socks5::REP_GENERAL_FAILURE,
+/// Ошибка TCP-connect к цели: таймаут или I/O.
+enum ConnectError {
+    Timeout,
+    Io(io::Error),
+}
+
+/// Сопоставляет ошибку TCP-connect с SOCKS5 REP-кодом (ADR-020).
+fn map_connect_error(e: &ConnectError) -> u8 {
+    match e {
+        // tokio::time::timeout → Elapsed → 0x04, как TimedOut в sync (ADR-020).
+        ConnectError::Timeout => socks5::REP_HOST_UNREACHABLE,
+        ConnectError::Io(io) => match io.kind() {
+            io::ErrorKind::ConnectionRefused => socks5::REP_CONNECTION_REFUSED,
+            io::ErrorKind::NetworkUnreachable => socks5::REP_NETWORK_UNREACHABLE,
+            io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => {
+                socks5::REP_HOST_UNREACHABLE
+            }
+            _ => socks5::REP_GENERAL_FAILURE,
+        },
     }
 }
 
 /// Разрешает цель в список IP-адресов (для домена — все адреса из DNS).
-fn resolve_target_ips(target: &socks5::Target) -> Result<Vec<IpAddr>, ProxyError> {
+async fn resolve_target_ips(target: &socks5::Target) -> Result<Vec<IpAddr>, ProxyError> {
     match &target.addr {
         socks5::Addr::IPv4(b) => Ok(vec![IpAddr::V4(Ipv4Addr::from(*b))]),
         socks5::Addr::IPv6(b) => Ok(vec![IpAddr::V6(Ipv6Addr::from(*b))]),
         socks5::Addr::Domain(d) => {
             let host = String::from_utf8_lossy(d).into_owned();
-            let ips = (host.as_str(), 0)
-                .to_socket_addrs()
+            let ips: Vec<IpAddr> = tokio::net::lookup_host((host.as_str(), target.port))
+                .await
                 .map_err(ProxyError::Io)?
                 .map(|a| a.ip())
-                .collect::<Vec<_>>();
+                .collect();
             if ips.is_empty() {
                 return Err(ProxyError::Io(io::Error::new(
                     io::ErrorKind::HostUnreachable,
@@ -230,93 +229,99 @@ fn resolve_target_ips(target: &socks5::Target) -> Result<Vec<IpAddr>, ProxyError
 }
 
 /// Подключается к `ip:port` с таймаутом.
-fn connect_ip(ip: IpAddr, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout)
+async fn connect_ip(ip: IpAddr, port: u16, timeout: Duration) -> Result<TcpStream, ConnectError> {
+    match tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port))).await {
+        Ok(Ok(sock)) => Ok(sock),
+        Ok(Err(e)) => Err(ConnectError::Io(e)),
+        Err(_) => Err(ConnectError::Timeout),
+    }
 }
 
-/// Обрабатывает одно соединение на стороне клиента (SOCKS5 → TLS).
+/// Обрабатывает одно соединение на стороне клиента (SOCKS5 → транспорт).
 ///
-/// После успешного CONNECT релеит байты между app-сокетом и TLS-потоком.
-pub fn serve_client_connection(
+/// После успешного CONNECT релеит байты между app-сокетом и транспортом.
+pub async fn serve_client_connection<T: Transport>(
     mut app: TcpStream,
-    mut client: ClientTransport,
+    mut client: T,
     ack_timeout: Duration,
 ) -> Result<(), ProxyError> {
-    let target = handshake(&mut app)?;
+    let target = handshake(&mut app).await?;
 
-    if let Err(e) = client.connect() {
+    if let Err(e) = client.connect().await {
         let _ = socks5::write_reply(
             &mut app,
             socks5::REP_GENERAL_FAILURE,
             &socks5::Addr::IPv4([0, 0, 0, 0]),
             0,
-        );
+        )
+        .await;
         return Err(ProxyError::Transport(e));
     }
 
-    client.set_read_timeout(Some(ack_timeout))?;
-
-    if let Err(e) = write_connect_target(&mut client, &target) {
+    if let Err(e) = write_connect_target(&mut client, &target).await {
         let _ = socks5::write_reply(
             &mut app,
             socks5::REP_GENERAL_FAILURE,
             &socks5::Addr::IPv4([0, 0, 0, 0]),
             0,
-        );
+        )
+        .await;
         return Err(e);
     }
 
-    // Ждём подтверждение соединения с целью от сервера.
-    let rep = match read_connect_ack(&mut client) {
-        Ok(rep) => rep,
-        Err(ProxyError::ConnectAckTimeout) => {
-            let _ = socks5::write_reply(
-                &mut app,
-                socks5::REP_HOST_UNREACHABLE,
-                &socks5::Addr::IPv4([0, 0, 0, 0]),
-                0,
-            );
-            return Ok(());
-        }
-        Err(_) => {
+    // Ждём ConnectAck с таймаутом. Elapsed → 0x04 (host unreachable, ADR-020).
+    let rep = match tokio::time::timeout(ack_timeout, read_connect_ack(&mut client)).await {
+        Ok(Ok(rep)) => rep,
+        Ok(Err(_)) => {
             let _ = socks5::write_reply(
                 &mut app,
                 socks5::REP_GENERAL_FAILURE,
                 &socks5::Addr::IPv4([0, 0, 0, 0]),
                 0,
-            );
+            )
+            .await;
+            return Ok(());
+        }
+        Err(_) => {
+            let _ = socks5::write_reply(
+                &mut app,
+                socks5::REP_HOST_UNREACHABLE,
+                &socks5::Addr::IPv4([0, 0, 0, 0]),
+                0,
+            )
+            .await;
             return Ok(());
         }
     };
 
     if rep != socks5::REP_SUCCESS {
-        let _ = socks5::write_reply(&mut app, rep, &socks5::Addr::IPv4([0, 0, 0, 0]), 0);
+        let _ = socks5::write_reply(&mut app, rep, &socks5::Addr::IPv4([0, 0, 0, 0]), 0).await;
         return Ok(());
     }
 
-    client.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
     socks5::write_reply(
         &mut app,
         socks5::REP_SUCCESS,
         &socks5::Addr::IPv4([0, 0, 0, 0]),
         0,
-    )?;
-    relay(app, client).map_err(ProxyError::Io)
+    )
+    .await?;
+    relay(app, client).await
 }
 
-/// Обрабатывает одно соединение на стороне сервера (TLS → TCP-цель).
-pub fn serve_server_connection(
-    mut server: ServerTransport,
+/// Обрабатывает одно соединение на стороне сервера (транспорт → TCP-цель).
+pub async fn serve_server_connection<T: Transport>(
+    mut server: T,
     connect_timeout: Duration,
     rules: &config::AddressRules,
 ) -> Result<(), ProxyError> {
-    let target = read_connect_target(&mut server)?;
-    let ips = resolve_target_ips(&target)?;
+    let target = read_connect_target(&mut server).await?;
+    let ips = resolve_target_ips(&target).await?;
 
     // Проверка адресных правил (SSRF) до подключения.
     for ip in &ips {
         if rules.check(*ip, target.port).is_err() {
-            let _ = write_connect_ack(&mut server, socks5::REP_CONNECTION_NOT_ALLOWED);
+            let _ = write_connect_ack(&mut server, socks5::REP_CONNECTION_NOT_ALLOWED).await;
             return Ok(());
         }
     }
@@ -324,7 +329,7 @@ pub fn serve_server_connection(
     let mut tcp = None;
     let mut last_err = None;
     for ip in &ips {
-        match connect_ip(*ip, target.port, connect_timeout) {
+        match connect_ip(*ip, target.port, connect_timeout).await {
             Ok(sock) => {
                 tcp = Some(sock);
                 break;
@@ -339,79 +344,45 @@ pub fn serve_server_connection(
                 .as_ref()
                 .map(map_connect_error)
                 .unwrap_or(socks5::REP_GENERAL_FAILURE);
-            let _ = write_connect_ack(&mut server, rep);
+            let _ = write_connect_ack(&mut server, rep).await;
             return Ok(());
         }
     };
 
-    write_connect_ack(&mut server, socks5::REP_SUCCESS)?;
-    server.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
-    relay(tcp, server).map_err(ProxyError::Io)
+    write_connect_ack(&mut server, socks5::REP_SUCCESS).await?;
+    relay(tcp, server).await
 }
 
-/// Двунаправленная передача байтов между TCP-сокетом и потоком.
+/// Двунаправленная передача байтов между TCP-сокетом и транспортом.
 ///
-/// Оба потока должны быть с настроенным таймаутом чтения [`RELAY_POLL_INTERVAL`]
-/// (таймаут TCP выставляется здесь). Завершение одной из сторон закрывает
-/// другую; обрыв соединения распознаётся как конец потока.
-pub fn relay<T: Read + Write>(mut tcp: TcpStream, mut stream: T) -> io::Result<()> {
-    tcp.set_read_timeout(Some(RELAY_POLL_INTERVAL))?;
+/// Полинг обеих сторон через `tokio::time::timeout` ([`RELAY_POLL_INTERVAL`]).
+/// Завершение одной из сторон закрывает другую.
+pub async fn relay<T: Transport>(mut tcp: TcpStream, mut transport: T) -> Result<(), ProxyError> {
     let mut buf = [0u8; 64 * 1024];
 
     loop {
-        // tcp -> stream
-        loop {
-            match tcp.read(&mut buf) {
-                Ok(0) => return Ok(()),
-                Ok(n) => stream.write_all(&buf[..n])?,
-                Err(e) => {
-                    if is_retryable(&e) {
-                        break;
-                    }
-                    if is_disconnect(&e) {
-                        return Ok(());
-                    }
-                    return Err(e);
-                }
+        // tcp -> transport
+        match tokio::time::timeout(RELAY_POLL_INTERVAL, tcp.read(&mut buf)).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => {
+                transport.send(&buf[..n]).await?;
             }
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => {}
         }
 
-        // stream -> tcp
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => {
-                    let _ = tcp.shutdown(Shutdown::Both);
-                    return Ok(());
-                }
-                Ok(n) => tcp.write_all(&buf[..n])?,
-                Err(e) => {
-                    if is_retryable(&e) {
-                        break;
-                    }
-                    if is_disconnect(&e) {
-                        let _ = tcp.shutdown(Shutdown::Both);
-                        return Ok(());
-                    }
-                    return Err(e);
-                }
+        // transport -> tcp
+        match tokio::time::timeout(RELAY_POLL_INTERVAL, transport.recv(&mut buf)).await {
+            Ok(Ok(0)) => {
+                let _ = tcp.shutdown().await;
+                return Ok(());
             }
+            Ok(Ok(n)) => tcp.write_all(&buf[..n]).await?,
+            Ok(Err(_)) => {
+                let _ = tcp.shutdown().await;
+                return Ok(());
+            }
+            Err(_) => {}
         }
     }
-}
-
-fn is_retryable(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
-}
-
-fn is_disconnect(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe
-    )
 }

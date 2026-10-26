@@ -26,3 +26,6 @@ rustls-pemfile = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
+async-trait = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

@@ -8,13 +8,14 @@
 //! +---------+---------+----------------+---------------+
 //! ```
 //!
-//! Заголовок — [`HEADER_LEN`] байт. Крейт не знает о транспорте и профиле.
+//! Заголовок — [`HEADER_LEN`] байт. Парсинг чистый; I/O асинхронный поверх
+//! [`Transport`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::fmt;
-use std::io::{Read, Write};
+use transport_api::{Transport, TransportError};
 
 /// Текущая версия протокола.
 pub const VERSION: u8 = 1;
@@ -193,12 +194,12 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
-/// Читает одно сообщение из потока.
-pub fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolError> {
+/// Читает одно сообщение из транспорта.
+pub async fn read_message<T: Transport + ?Sized>(
+    transport: &mut T,
+) -> Result<Message, ProtocolError> {
     let mut header = [0u8; HEADER_LEN];
-    reader
-        .read_exact(&mut header)
-        .map_err(|e| ProtocolError::Io(e.to_string()))?;
+    read_exact(transport, &mut header).await.map_err(io_err)?;
 
     let version = header[0];
     if version != VERSION {
@@ -219,19 +220,39 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolError> {
     }
 
     let mut payload = vec![0u8; len];
-    reader
-        .read_exact(&mut payload)
-        .map_err(|e| ProtocolError::Io(e.to_string()))?;
+    read_exact(transport, &mut payload).await.map_err(io_err)?;
 
     Ok(Message { kind, payload })
 }
 
-/// Записывает одно сообщение в поток.
-pub fn write_message<W: Write>(writer: &mut W, message: &Message) -> Result<(), ProtocolError> {
+/// Записывает одно сообщение в транспорт.
+pub async fn write_message<T: Transport + ?Sized>(
+    transport: &mut T,
+    message: &Message,
+) -> Result<(), ProtocolError> {
     let encoded = message.encode()?;
-    writer
-        .write_all(&encoded)
-        .map_err(|e| ProtocolError::Io(e.to_string()))
+    transport.send(&encoded).await.map_err(io_err)?;
+    Ok(())
+}
+
+/// Читает ровно `buf.len()` байт из транспорта (аналог `read_exact`).
+async fn read_exact<T: Transport + ?Sized>(
+    transport: &mut T,
+    buf: &mut [u8],
+) -> Result<(), TransportError> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = transport.recv(&mut buf[filled..]).await?;
+        if n == 0 {
+            return Err(TransportError::Closed);
+        }
+        filled += n;
+    }
+    Ok(())
+}
+
+fn io_err(e: TransportError) -> ProtocolError {
+    ProtocolError::Io(e.to_string())
 }
 
 #[cfg(test)]
@@ -300,15 +321,5 @@ mod tests {
             m.encode().unwrap_err(),
             ProtocolError::PayloadTooLarge { .. }
         ));
-    }
-
-    #[test]
-    fn stream_roundtrip() {
-        let m = Message::new(MessageKind::Control, vec![1, 2, 3, 4]);
-        let mut buf = Vec::new();
-        write_message(&mut buf, &m).unwrap();
-        let mut cursor = std::io::Cursor::new(buf);
-        let got = read_message(&mut cursor).unwrap();
-        assert_eq!(got, m);
     }
 }

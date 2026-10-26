@@ -2,7 +2,8 @@
 
 use std::net::SocketAddr;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 || args[1] != "check" {
         eprintln!("usage: diag-cli check <host>:<port>");
@@ -27,7 +28,11 @@ fn main() {
     };
 
     println!("diag check {} -> server {server_addr}", args[2]);
-    for (i, stage) in diag_cli::run_check(server_addr, &target).iter().enumerate() {
+    for (i, stage) in diag_cli::run_check(server_addr, &target)
+        .await
+        .iter()
+        .enumerate()
+    {
         match &stage.status {
             diag_cli::StageStatus::Ok => println!("[{}] {:<10} OK", i + 1, stage.name),
             diag_cli::StageStatus::Failed(cls) => {

@@ -5,12 +5,12 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::{ClientConfig, RootCertStore};
+use transport_tls::{ClientTransport, Transport};
 
 /// Адрес сервера по умолчанию.
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8443";
@@ -98,46 +98,18 @@ pub fn load_client_config() -> Result<Arc<ClientConfig>, Box<dyn std::error::Err
 }
 
 /// Прогоняет диагностику до цели и возвращает результаты этапов.
-pub fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageResult> {
+pub async fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageResult> {
     transport_tls::ensure_crypto_provider();
     let mut out = Vec::new();
 
-    // [1] connect
-    let sock = match TcpStream::connect_timeout(&server_addr, TIMEOUT) {
-        Ok(s) => {
-            out.push(StageResult {
-                name: "connect",
-                status: StageStatus::Ok,
-            });
-            s
-        }
-        Err(e) => {
-            out.push(StageResult {
-                name: "connect",
-                status: StageStatus::Failed(io_class(&e).into()),
-            });
-            skip(&mut out, &["tls", "socks5", "relay"]);
-            return out;
-        }
-    };
-    let _ = sock.set_read_timeout(Some(TIMEOUT));
-    let _ = sock.set_write_timeout(Some(TIMEOUT));
-
-    // [2] tls
+    // [1] connect + [2] tls (через ClientTransport::connect).
     let config = match load_client_config() {
         Ok(c) => c,
         Err(e) => {
             out.push(StageResult {
-                name: "tls",
-                status: StageStatus::Failed(e.to_string()),
+                name: "connect",
+                status: StageStatus::Skipped,
             });
-            skip(&mut out, &["socks5", "relay"]);
-            return out;
-        }
-    };
-    let server_name = match ServerName::try_from("localhost".to_owned()) {
-        Ok(n) => n,
-        Err(e) => {
             out.push(StageResult {
                 name: "tls",
                 status: StageStatus::Failed(e.to_string()),
@@ -146,10 +118,15 @@ pub fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageR
             return out;
         }
     };
-    let conn = match ClientConnection::new(config, server_name) {
+    let mut client = match ClientTransport::new(server_addr, "localhost", config, TIMEOUT, TIMEOUT)
+    {
         Ok(c) => c,
         Err(e) => {
             out.push(StageResult {
+                name: "connect",
+                status: StageStatus::Skipped,
+            });
+            out.push(StageResult {
                 name: "tls",
                 status: StageStatus::Failed(e.to_string()),
             });
@@ -157,27 +134,42 @@ pub fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageR
             return out;
         }
     };
-    let mut stream = StreamOwned::new(conn, sock);
-    loop {
-        if !stream.conn.is_handshaking() {
-            break;
-        }
-        if let Err(e) = stream.conn.complete_io(&mut stream.sock) {
+    match client.connect().await {
+        Ok(()) => {
+            out.push(StageResult {
+                name: "connect",
+                status: StageStatus::Ok,
+            });
             out.push(StageResult {
                 name: "tls",
-                status: StageStatus::Failed(io_class(&e).into()),
+                status: StageStatus::Ok,
+            });
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("tcp connect") {
+                out.push(StageResult {
+                    name: "connect",
+                    status: StageStatus::Failed(msg),
+                });
+                skip(&mut out, &["tls", "socks5", "relay"]);
+                return out;
+            }
+            out.push(StageResult {
+                name: "connect",
+                status: StageStatus::Ok,
+            });
+            out.push(StageResult {
+                name: "tls",
+                status: StageStatus::Failed(msg),
             });
             skip(&mut out, &["socks5", "relay"]);
             return out;
         }
     }
-    out.push(StageResult {
-        name: "tls",
-        status: StageStatus::Ok,
-    });
 
     // [3] socks5 (Connect + ConnectAck)
-    if let Err(e) = proxy_core::write_connect_target(&mut stream, target) {
+    if let Err(e) = proxy_core::write_connect_target(&mut client, target).await {
         out.push(StageResult {
             name: "socks5",
             status: StageStatus::Failed(e.to_string()),
@@ -185,16 +177,21 @@ pub fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageR
         skip(&mut out, &["relay"]);
         return out;
     }
-    let rep = match proxy_core::read_connect_ack(&mut stream) {
-        Ok(rep) => rep,
-        Err(e) => {
-            let cls = match e {
-                proxy_core::ProxyError::ConnectAckTimeout => "timeout",
-                _ => "protocol-error",
-            };
+    let rep = match tokio::time::timeout(TIMEOUT, proxy_core::read_connect_ack(&mut client)).await {
+        Ok(Ok(rep)) => rep,
+        Ok(Err(e)) => {
             out.push(StageResult {
                 name: "socks5",
-                status: StageStatus::Failed(cls.into()),
+                status: StageStatus::Failed(e.to_string()),
+            });
+            skip(&mut out, &["relay"]);
+            return out;
+        }
+        Err(_) => {
+            // Elapsed — таймаут ack.
+            out.push(StageResult {
+                name: "socks5",
+                status: StageStatus::Failed("timeout".into()),
             });
             skip(&mut out, &["relay"]);
             return out;

@@ -1,13 +1,13 @@
 //! SOCKS5 wire-протокол: парсинг приветствия, методов, запросов и ответов.
 //!
-//! Чистый парсер без I/O-оркестрации: работает поверх `std::io::Read`/`Write`.
-//! Не знает о транспорте и профиле.
+//! Парсинг чистый (без I/O); I/O-обёртки асинхронные поверх
+//! `tokio::io::AsyncRead`/`AsyncWrite`. Не знает о транспорте и профиле.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use std::fmt;
-use std::io::{Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Версия протокола SOCKS5.
 pub const VERSION: u8 = 0x05;
@@ -186,38 +186,41 @@ pub struct Request {
 }
 
 /// Читает приветствие.
-pub fn read_greeting<R: Read>(reader: &mut R) -> Result<Greeting, Socks5Error> {
+pub async fn read_greeting<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Greeting, Socks5Error> {
     let mut head = [0u8; 2];
-    reader.read_exact(&mut head).map_err(io_err)?;
+    reader.read_exact(&mut head).await.map_err(io_err)?;
     let version = head[0];
     if version != VERSION {
         return Err(Socks5Error::UnsupportedVersion(version));
     }
     let nmethods = head[1] as usize;
     let mut methods = vec![0u8; nmethods];
-    reader.read_exact(&mut methods).map_err(io_err)?;
+    reader.read_exact(&mut methods).await.map_err(io_err)?;
     Ok(Greeting { version, methods })
 }
 
 /// Записывает выбор метода аутентификации.
-pub fn write_method_selection<W: Write>(writer: &mut W, method: u8) -> Result<(), Socks5Error> {
-    writer.write_all(&[VERSION, method]).map_err(io_err)
+pub async fn write_method_selection<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    method: u8,
+) -> Result<(), Socks5Error> {
+    writer.write_all(&[VERSION, method]).await.map_err(io_err)
 }
 
 /// Читает запрос (CONNECT/BIND/UDP ASSOCIATE).
-pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, Socks5Error> {
+pub async fn read_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Request, Socks5Error> {
     let mut head = [0u8; 4]; // VER CMD RSV ATYP
-    reader.read_exact(&mut head).map_err(io_err)?;
+    reader.read_exact(&mut head).await.map_err(io_err)?;
     let version = head[0];
     if version != VERSION {
         return Err(Socks5Error::UnsupportedVersion(version));
     }
     let command = Command::from_u8(head[1])?;
     // head[2] — RSV, игнорируется.
-    let addr = read_addr(reader, head[3])?;
+    let addr = read_addr(reader, head[3]).await?;
 
     let mut port_bytes = [0u8; 2];
-    reader.read_exact(&mut port_bytes).map_err(io_err)?;
+    reader.read_exact(&mut port_bytes).await.map_err(io_err)?;
     let port = u16::from_be_bytes(port_bytes);
 
     Ok(Request {
@@ -228,7 +231,7 @@ pub fn read_request<R: Read>(reader: &mut R) -> Result<Request, Socks5Error> {
 }
 
 /// Записывает ответ: VER + REP + RSV + ATYP + BND.ADDR + BND.PORT.
-pub fn write_reply<W: Write>(
+pub async fn write_reply<W: AsyncWrite + Unpin>(
     writer: &mut W,
     reply_code: u8,
     bind_addr: &Addr,
@@ -236,24 +239,25 @@ pub fn write_reply<W: Write>(
 ) -> Result<(), Socks5Error> {
     writer
         .write_all(&[VERSION, reply_code, 0x00])
+        .await
         .map_err(io_err)?;
     let bind = Target {
         addr: bind_addr.clone(),
         port: bind_port,
     };
-    writer.write_all(&bind.encode()).map_err(io_err)
+    writer.write_all(&bind.encode()).await.map_err(io_err)
 }
 
-fn read_addr<R: Read>(reader: &mut R, atyp: u8) -> Result<Addr, Socks5Error> {
+async fn read_addr<R: AsyncRead + Unpin>(reader: &mut R, atyp: u8) -> Result<Addr, Socks5Error> {
     match atyp {
         ATYP_IPV4 => {
             let mut b = [0u8; 4];
-            reader.read_exact(&mut b).map_err(io_err)?;
+            reader.read_exact(&mut b).await.map_err(io_err)?;
             Ok(Addr::IPv4(b))
         }
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
-            reader.read_exact(&mut len).map_err(io_err)?;
+            reader.read_exact(&mut len).await.map_err(io_err)?;
             let dlen = len[0] as usize;
             if dlen > MAX_DOMAIN_LEN {
                 return Err(Socks5Error::DomainTooLong {
@@ -262,12 +266,12 @@ fn read_addr<R: Read>(reader: &mut R, atyp: u8) -> Result<Addr, Socks5Error> {
                 });
             }
             let mut d = vec![0u8; dlen];
-            reader.read_exact(&mut d).map_err(io_err)?;
+            reader.read_exact(&mut d).await.map_err(io_err)?;
             Ok(Addr::Domain(d))
         }
         ATYP_IPV6 => {
             let mut b = [0u8; 16];
-            reader.read_exact(&mut b).map_err(io_err)?;
+            reader.read_exact(&mut b).await.map_err(io_err)?;
             Ok(Addr::IPv6(b))
         }
         other => Err(Socks5Error::AddressTypeNotSupported(other)),
@@ -321,27 +325,27 @@ impl std::error::Error for Socks5Error {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn greeting_no_auth() {
+    #[tokio::test]
+    async fn greeting_no_auth() {
         let mut data: &[u8] = &[0x05, 0x02, 0x00, 0x02];
-        let g = read_greeting(&mut data).unwrap();
+        let g = read_greeting(&mut data).await.unwrap();
         assert_eq!(g.version, VERSION);
         assert_eq!(g.methods, vec![0x00, 0x02]);
     }
 
-    #[test]
-    fn greeting_bad_version() {
+    #[tokio::test]
+    async fn greeting_bad_version() {
         let mut data: &[u8] = &[0x04, 0x01, 0x00];
         assert_eq!(
-            read_greeting(&mut data).unwrap_err(),
+            read_greeting(&mut data).await.unwrap_err(),
             Socks5Error::UnsupportedVersion(0x04)
         );
     }
 
-    #[test]
-    fn request_connect_ipv4() {
+    #[tokio::test]
+    async fn request_connect_ipv4() {
         let mut data: &[u8] = &[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 0x50];
-        let r = read_request(&mut data).unwrap();
+        let r = read_request(&mut data).await.unwrap();
         assert_eq!(r.command, Command::Connect);
         assert_eq!(
             r.target,
@@ -352,23 +356,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_bind_and_udp_parsed() {
+    #[tokio::test]
+    async fn request_bind_and_udp_parsed() {
         let mut udp: &[u8] = &[0x05, 0x03, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x01];
         assert_eq!(
-            read_request(&mut udp).unwrap().command,
+            read_request(&mut udp).await.unwrap().command,
             Command::UdpAssociate
         );
 
         let mut bind: &[u8] = &[0x05, 0x02, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x01];
-        assert_eq!(read_request(&mut bind).unwrap().command, Command::Bind);
+        assert_eq!(
+            read_request(&mut bind).await.unwrap().command,
+            Command::Bind
+        );
     }
 
-    #[test]
-    fn request_unknown_command() {
+    #[tokio::test]
+    async fn request_unknown_command() {
         let mut data: &[u8] = &[0x05, 0x09, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x01];
         assert_eq!(
-            read_request(&mut data).unwrap_err(),
+            read_request(&mut data).await.unwrap_err(),
             Socks5Error::UnsupportedCommand(0x09)
         );
     }

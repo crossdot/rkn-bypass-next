@@ -6,10 +6,11 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
+
+use tokio::net::TcpListener;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
@@ -43,7 +44,8 @@ fn load_client_config(
     ))
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
 
     let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:1080");
@@ -64,13 +66,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = load_client_config(&ca_path, &client_cert, &client_key)?;
-    let listener = TcpListener::bind(&listen_addr)?;
+    let listener = TcpListener::bind(&listen_addr).await?;
     println!("SOCKS5 listening on {listen_addr} (server {server_addr})");
 
-    for stream in listener.incoming() {
-        let app = stream?;
+    loop {
+        let (app, _) = listener.accept().await?;
         let config = Arc::clone(&config);
-        thread::spawn(move || {
+        tokio::spawn(async move {
             let client = match ClientTransport::new(
                 server_addr,
                 "localhost",
@@ -85,11 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             if let Err(e) =
-                proxy_core::serve_client_connection(app, client, proxy_core::ACK_TIMEOUT)
+                proxy_core::serve_client_connection(app, client, proxy_core::ACK_TIMEOUT).await
             {
                 eprintln!("connection error: {e}");
             }
         });
     }
-    Ok(())
 }
