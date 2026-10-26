@@ -1,0 +1,16 @@
+[package]
+name = "transport-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+transport-api = { path = "../transport-api" }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
+rustls-pemfile = { workspace = true }

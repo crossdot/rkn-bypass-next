@@ -1,0 +1,116 @@
+//! Общий набор контрактных тестов для реализаций [`Transport`].
+//!
+//! Логика тестов одна; каждая транспортная реализация предоставляет свою
+//! фабрику `make_pair` (поднять сервер + подключить клиента) и зовёт
+//! [`contract_suite`].
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+use std::future::Future;
+
+use transport_api::Transport;
+
+/// Прогоняет контрактные тесты над парой (клиент, сервер).
+///
+/// `make_pair` возвращает **уже соединённую** пару; вызывается заново для
+/// каждого кейса.
+pub async fn contract_suite<C, S, Fut>(make_pair: impl Fn() -> Fut)
+where
+    C: Transport + Send,
+    S: Transport + Send,
+    Fut: Future<Output = (C, S)>,
+{
+    send_recv_echo(&make_pair).await;
+    recv_ends_after_close(&make_pair).await;
+    send_after_close_fails(&make_pair).await;
+    mid_transfer_drop_detected(&make_pair).await;
+}
+
+async fn send_recv_echo<C, S, Fut>(make_pair: &impl Fn() -> Fut)
+where
+    C: Transport + Send,
+    S: Transport + Send,
+    Fut: Future<Output = (C, S)>,
+{
+    let (mut client, mut server) = make_pair().await;
+    let payload = b"hello-contract";
+
+    client.send(payload).await.unwrap();
+    let mut got = read_exact(&mut server, payload.len()).await;
+    assert_eq!(got.as_slice(), payload, "server должен получить payload");
+
+    server.send(&got).await.unwrap();
+    got = read_exact(&mut client, payload.len()).await;
+    assert_eq!(got.as_slice(), payload, "client должен получить echo");
+
+    client.close().await.unwrap();
+}
+
+async fn recv_ends_after_close<C, S, Fut>(make_pair: &impl Fn() -> Fut)
+where
+    C: Transport + Send,
+    S: Transport + Send,
+    Fut: Future<Output = (C, S)>,
+{
+    let (mut client, mut server) = make_pair().await;
+    client.close().await.unwrap();
+    // После close сервер видит конец потока: Ok(0) (EOF) или ошибку (сброс).
+    let mut buf = [0u8; 16];
+    match server.recv(&mut buf).await {
+        Ok(0) => {}
+        Ok(n) => panic!("ожидался конец потока, получено {n} байт"),
+        Err(_) => {}
+    }
+}
+
+async fn send_after_close_fails<C, S, Fut>(make_pair: &impl Fn() -> Fut)
+where
+    C: Transport + Send,
+    S: Transport + Send,
+    Fut: Future<Output = (C, S)>,
+{
+    let (mut client, _server) = make_pair().await;
+    client.close().await.unwrap();
+    assert!(
+        client.send(b"x").await.is_err(),
+        "send после close должен вернуть ошибку"
+    );
+}
+
+async fn mid_transfer_drop_detected<C, S, Fut>(make_pair: &impl Fn() -> Fut)
+where
+    C: Transport + Send,
+    S: Transport + Send,
+    Fut: Future<Output = (C, S)>,
+{
+    let (mut client, mut server) = make_pair().await;
+    server.send(b"0123456789").await.unwrap();
+    drop(server); // резкий обрыв без graceful close
+
+    let mut total = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        match client.recv(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => total.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        total, b"0123456789",
+        "клиент должен получить данные до обрыва"
+    );
+}
+
+/// Читает ровно `len` байт через [`Transport::recv`].
+async fn read_exact<T: Transport + ?Sized>(t: &mut T, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        let n = t.recv(&mut out[filled..]).await.expect("recv");
+        assert!(n > 0, "неожиданный EOF");
+        filled += n;
+    }
+    out
+}
