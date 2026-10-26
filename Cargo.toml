@@ -10,6 +10,7 @@ members = [
     "crates/transport-tls",
     "crates/transport-quic",
     "crates/transport-any",
+    "crates/transport-manager",
     "crates/proxy-core",
     "crates/testkit",
     "apps/client",

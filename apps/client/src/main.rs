@@ -1,8 +1,15 @@
 //! SOCKS5-клиент: принимает CONNECT от приложений и проксирует их через
 //! TLS или QUIC (с mTLS) к серверу.
 //!
-//! Конфигурация через env: `TRANSPORT` (`tls`|`quic`, дефолт `tls`),
-//! `LISTEN_ADDR`, `SERVER_ADDR`, `CA_PATH`, `CLIENT_CERT`, `CLIENT_KEY`.
+//! Транспорт выбирает `TransportManager` (P5.3): детерминированная политика
+//! `preferred` → fallback, TTL-кэш и backoff. Конфигурация через env:
+//! `TRANSPORT` (`auto`|`tls`|`quic`, дефолт `auto`), `TRANSPORT_PREFERRED`,
+//! `TRANSPORT_PROBE_TIMEOUT_MS`, `TRANSPORT_TTL_S`, `TRANSPORT_FAIL_TTL_S`,
+//! `TRANSPORT_PROBE_ATTEMPTS`, `LISTEN_ADDR`, `SERVER_ADDR`, `CA_PATH`,
+//! `CLIENT_CERT`, `CLIENT_KEY`.
+//!
+//! События выбора: `event=transport_selected` / `event=transport_state`
+//! (см. ADR-023).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -15,7 +22,12 @@ use tokio::net::TcpListener;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use transport_any::AnyClientTransport;
-use transport_tls::{ensure_crypto_provider, ClientTransport};
+use transport_manager::{Probe, TransportFactory, TransportManager, TransportProbe};
+use transport_tls::{ensure_crypto_provider, TransportError};
+
+const SERVER_NAME: &str = "localhost";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
@@ -43,14 +55,36 @@ fn load_client_config(
         .with_client_auth_cert(certs, key)?)
 }
 
+/// Создаёт транспорт нужного типа через общий конструктор
+/// (`transport-manager::client_transport`) — без дублирования в приложениях.
+fn build_transport(
+    kind: config::TransportKind,
+    server_addr: SocketAddr,
+    rustls_config: &Arc<ClientConfig>,
+) -> Result<AnyClientTransport, TransportError> {
+    transport_manager::client_transport(
+        kind,
+        server_addr,
+        SERVER_NAME,
+        rustls_config,
+        CONNECT_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
+    tracing_subscriber::fmt()
+        .compact()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
-    let kind = match std::env::var("TRANSPORT") {
-        Ok(v) => v.parse::<config::TransportKind>()?,
-        Err(_) => config::TransportKind::Tls,
-    };
+    let policy = config::TransportPolicy::from_env()?;
     let listen_addr = env_or("LISTEN_ADDR", "127.0.0.1:1080");
     let server_addr_str = env_or("SERVER_ADDR", "127.0.0.1:8443");
     let server_addr: SocketAddr = server_addr_str
@@ -68,56 +102,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("CLIENT_CERT and CLIENT_KEY must be set".into());
     }
 
-    let rustls_config = load_client_config(&ca_path, &client_cert, &client_key)?;
+    let rustls_config = Arc::new(load_client_config(&ca_path, &client_cert, &client_key)?);
+
+    let factory: TransportFactory = {
+        let rustls_config = Arc::clone(&rustls_config);
+        Arc::new(move |kind| build_transport(kind, server_addr, &rustls_config))
+    };
+    let probe: Arc<dyn Probe> = Arc::new(TransportProbe::new(
+        Arc::clone(&factory),
+        policy.probe_timeout,
+        server_addr,
+    ));
+    let manager = Arc::new(TransportManager::new(policy.clone(), probe));
+
     let listener = TcpListener::bind(&listen_addr).await?;
-    println!("SOCKS5 listening on {listen_addr} (transport={kind:?}, server {server_addr})");
+    println!(
+        "SOCKS5 listening on {listen_addr} (strategy={:?}, preferred={:?}, server {server_addr})",
+        policy.strategy, policy.preferred
+    );
 
     loop {
         let (app, _) = listener.accept().await?;
-        let rustls_config = rustls_config.clone();
+        let manager = Arc::clone(&manager);
+        let factory = Arc::clone(&factory);
         tokio::spawn(async move {
-            let client = match kind {
-                config::TransportKind::Tls => {
-                    match ClientTransport::new(
-                        server_addr,
-                        "localhost",
-                        Arc::new(rustls_config),
-                        Duration::from_secs(5),
-                        Duration::from_secs(10),
-                    ) {
-                        Ok(c) => AnyClientTransport::Tls(c),
-                        Err(e) => {
-                            eprintln!("client init error: {e}");
-                            return;
-                        }
-                    }
-                }
-                config::TransportKind::Quic => {
-                    let quinn_config = match transport_quic::client_config(rustls_config) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("quic client config error: {e}");
-                            return;
-                        }
-                    };
-                    match transport_quic::QuicClientTransport::new(
-                        server_addr,
-                        "localhost",
-                        quinn_config,
-                        Duration::from_secs(5),
-                    ) {
-                        Ok(c) => AnyClientTransport::Quic(c),
-                        Err(e) => {
-                            eprintln!("client init error: {e}");
-                            return;
-                        }
-                    }
+            let selection = manager.select().await;
+            let client = match factory(selection.kind) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("client init error: {e}");
+                    return;
                 }
             };
-            if let Err(e) =
-                proxy_core::serve_client_connection(app, client, proxy_core::ACK_TIMEOUT).await
-            {
-                eprintln!("connection error: {e}");
+            match proxy_core::serve_client_connection(app, client, proxy_core::ACK_TIMEOUT).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("connection error: {e}");
+                    // Транспортный сбой (не ответ цели) — повод перепроверить
+                    // доступность на следующем соединении.
+                    if matches!(e, proxy_core::ProxyError::Transport(_)) {
+                        manager
+                            .invalidate(
+                                selection.kind,
+                                transport_manager::SelectReason::FallbackPrevFailed,
+                            )
+                            .await;
+                    }
+                }
             }
         });
     }

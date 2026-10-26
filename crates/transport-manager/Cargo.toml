@@ -1,0 +1,24 @@
+[package]
+name = "transport-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+config = { path = "../config" }
+protocol = { path = "../protocol" }
+transport-api = { path = "../transport-api" }
+transport-any = { path = "../transport-any" }
+transport-tls = { path = "../transport-tls" }
+transport-quic = { path = "../transport-quic" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tracing-test = { workspace = true }
+rustls-pemfile = { workspace = true }
+protocol = { path = "../protocol" }
+proxy-core = { path = "../proxy-core" }
+socks5 = { path = "../socks5" }

@@ -14,7 +14,10 @@ rustls-pemfile = { workspace = true }
 transport-tls = { path = "../../crates/transport-tls" }
 transport-quic = { path = "../../crates/transport-quic" }
 transport-any = { path = "../../crates/transport-any" }
+transport-manager = { path = "../../crates/transport-manager" }
 config = { path = "../../crates/config" }
 quinn = { workspace = true }
 proxy-core = { path = "../../crates/proxy-core" }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

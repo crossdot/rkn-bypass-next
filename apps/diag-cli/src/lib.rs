@@ -1,4 +1,8 @@
-//! Логика диагностики цепочки connect → TLS → SOCKS5 → relay.
+//! Логика диагностики цепочки connect → handshake → data (Ping/Pong) → SOCKS5.
+//!
+//! Проверка доступности и передача данных выполняются общим модулем
+//! `transport-manager` (та же проба, что у политики выбора транспорта), чтобы
+//! diag-cli и runtime не расходились.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -10,12 +14,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::{ClientConfig, RootCertStore};
-use transport_tls::{ClientTransport, Transport};
+use transport_manager::{client_transport, Probe, ProbeFailure, TransportProbe};
+use transport_tls::Transport;
 
 /// Адрес сервера по умолчанию.
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:8443";
 /// Таймаут каждой сетевой операции.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Статус этапа диагностики.
 #[derive(Debug, PartialEq, Eq)]
@@ -83,26 +90,74 @@ pub fn rep_class(rep: u8) -> &'static str {
     }
 }
 
-/// Загружает клиентский TLS-конфиг (доверяет dev CA).
+/// Загружает клиентский TLS-конфиг.
+///
+/// `CA_PATH` переопределяет CA (по умолчанию dev CA). Если заданы и
+/// `CLIENT_CERT`, и `CLIENT_KEY` — включается mTLS (как у клиента против
+/// текущего сервера, ADR-021); иначе — без клиентского сертификата.
 pub fn load_client_config() -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
-    let ca_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt");
+    let ca_path = std::env::var("CA_PATH").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt").to_string()
+    });
     let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(ca_path)?)) {
+    for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(&ca_path)?)) {
         roots.add(cert?)?;
     }
-    Ok(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ))
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+
+    let cert_path = std::env::var("CLIENT_CERT").ok().filter(|s| !s.is_empty());
+    let key_path = std::env::var("CLIENT_KEY").ok().filter(|s| !s.is_empty());
+    let config = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
+                .collect::<Result<_, _>>()?;
+            let key = rustls_pemfile::private_key(&mut BufReader::new(File::open(&key_path)?))?
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "client key not found")
+                })?;
+            builder.with_client_auth_cert(certs, key)?
+        }
+        _ => builder.with_no_client_auth(),
+    };
+    Ok(Arc::new(config))
 }
 
-/// Прогоняет диагностику до цели и возвращает результаты этапов.
-pub async fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageResult> {
+fn ok(name: &'static str) -> StageResult {
+    StageResult {
+        name,
+        status: StageStatus::Ok,
+    }
+}
+
+fn failed(name: &'static str, msg: impl Into<String>) -> StageResult {
+    StageResult {
+        name,
+        status: StageStatus::Failed(msg.into()),
+    }
+}
+
+fn failure_message(failure: &ProbeFailure) -> String {
+    match failure {
+        ProbeFailure::UdpFiltered => "udp-filtered".into(),
+        ProbeFailure::TlsRefused => "tls-refused".into(),
+        ProbeFailure::ServerUnreachable => "server-unreachable".into(),
+        ProbeFailure::Handshake(msg) => format!("handshake: {msg}"),
+        ProbeFailure::DataPath(msg) => format!("data-path: {msg}"),
+    }
+}
+
+/// Прогоняет диагностику до цели для указанного транспорта.
+///
+/// Этапы: `connect` → `handshake` → `data` (Ping/Pong, 1 байт) → `socks5`
+/// (Connect + ConnectAck на отдельном соединении).
+pub async fn run_check_kind(
+    server_addr: SocketAddr,
+    target: &socks5::Target,
+    kind: config::TransportKind,
+) -> Vec<StageResult> {
     transport_tls::ensure_crypto_provider();
     let mut out = Vec::new();
 
-    // [1] connect + [2] tls (через ClientTransport::connect).
     let config = match load_client_config() {
         Ok(c) => c,
         Err(e) => {
@@ -110,112 +165,106 @@ pub async fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<
                 name: "connect",
                 status: StageStatus::Skipped,
             });
-            out.push(StageResult {
-                name: "tls",
-                status: StageStatus::Failed(e.to_string()),
-            });
-            skip(&mut out, &["socks5", "relay"]);
+            out.push(failed("handshake", e.to_string()));
+            skip(&mut out, &["data", "socks5"]);
             return out;
         }
     };
-    let mut client = match ClientTransport::new(server_addr, "localhost", config, TIMEOUT, TIMEOUT)
-    {
-        Ok(c) => c,
-        Err(e) => {
-            out.push(StageResult {
-                name: "connect",
-                status: StageStatus::Skipped,
-            });
-            out.push(StageResult {
-                name: "tls",
-                status: StageStatus::Failed(e.to_string()),
-            });
-            skip(&mut out, &["socks5", "relay"]);
+
+    let factory: transport_manager::TransportFactory = {
+        let config = Arc::clone(&config);
+        Arc::new(move |k: config::TransportKind| {
+            client_transport(
+                k,
+                server_addr,
+                "localhost",
+                &config,
+                CONNECT_TIMEOUT,
+                HANDSHAKE_TIMEOUT,
+            )
+        })
+    };
+    let probe = TransportProbe::new(factory, TIMEOUT, server_addr);
+    let report = probe.probe(kind).await;
+
+    match report.failure {
+        None => {
+            out.push(ok("connect"));
+            out.push(ok("handshake"));
+            out.push(ok("data"));
+        }
+        Some(
+            failure @ (ProbeFailure::TlsRefused
+            | ProbeFailure::UdpFiltered
+            | ProbeFailure::ServerUnreachable),
+        ) => {
+            out.push(failed("connect", failure_message(&failure)));
+            skip(&mut out, &["handshake", "data", "socks5"]);
             return out;
         }
-    };
-    match client.connect().await {
-        Ok(()) => {
-            out.push(StageResult {
-                name: "connect",
-                status: StageStatus::Ok,
-            });
-            out.push(StageResult {
-                name: "tls",
-                status: StageStatus::Ok,
-            });
+        Some(failure @ ProbeFailure::Handshake(_)) => {
+            out.push(ok("connect"));
+            out.push(failed("handshake", failure_message(&failure)));
+            skip(&mut out, &["data", "socks5"]);
+            return out;
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("tcp connect") {
-                out.push(StageResult {
-                    name: "connect",
-                    status: StageStatus::Failed(msg),
-                });
-                skip(&mut out, &["tls", "socks5", "relay"]);
-                return out;
-            }
-            out.push(StageResult {
-                name: "connect",
-                status: StageStatus::Ok,
-            });
-            out.push(StageResult {
-                name: "tls",
-                status: StageStatus::Failed(msg),
-            });
-            skip(&mut out, &["socks5", "relay"]);
+        Some(failure @ ProbeFailure::DataPath(_)) => {
+            out.push(ok("connect"));
+            out.push(ok("handshake"));
+            out.push(failed("data", failure_message(&failure)));
+            skip(&mut out, &["socks5"]);
             return out;
         }
     }
 
-    // [3] socks5 (Connect + ConnectAck)
+    // SOCKS5-этап: отдельное соединение (после Ping сервер закрывает поток).
+    let mut client = match client_transport(
+        kind,
+        server_addr,
+        "localhost",
+        &config,
+        CONNECT_TIMEOUT,
+        HANDSHAKE_TIMEOUT,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            out.push(failed("socks5", e.to_string()));
+            return out;
+        }
+    };
+    if let Err(e) = client.connect().await {
+        out.push(failed("socks5", e.to_string()));
+        return out;
+    }
     if let Err(e) = proxy_core::write_connect_target(&mut client, target).await {
-        out.push(StageResult {
-            name: "socks5",
-            status: StageStatus::Failed(e.to_string()),
-        });
-        skip(&mut out, &["relay"]);
+        out.push(failed("socks5", e.to_string()));
         return out;
     }
     let rep = match tokio::time::timeout(TIMEOUT, proxy_core::read_connect_ack(&mut client)).await {
         Ok(Ok(rep)) => rep,
         Ok(Err(e)) => {
-            out.push(StageResult {
-                name: "socks5",
-                status: StageStatus::Failed(e.to_string()),
-            });
-            skip(&mut out, &["relay"]);
+            out.push(failed("socks5", e.to_string()));
             return out;
         }
         Err(_) => {
-            // Elapsed — таймаут ack.
-            out.push(StageResult {
-                name: "socks5",
-                status: StageStatus::Failed("timeout".into()),
-            });
-            skip(&mut out, &["relay"]);
+            out.push(failed("socks5", "timeout"));
             return out;
         }
     };
     if rep != 0x00 {
-        out.push(StageResult {
-            name: "socks5",
-            status: StageStatus::Failed(format!("{} (0x{rep:02x})", rep_class(rep))),
-        });
-        skip(&mut out, &["relay"]);
+        out.push(failed(
+            "socks5",
+            format!("{} (0x{rep:02x})", rep_class(rep)),
+        ));
         return out;
     }
-    out.push(StageResult {
-        name: "socks5",
-        status: StageStatus::Ok,
-    });
-
-    // [4] relay
-    out.push(StageResult {
-        name: "relay",
-        status: StageStatus::Ok,
-    });
+    out.push(ok("socks5"));
     out
+}
+
+/// Совместимая обёртка: проверка TLS-транспорта.
+pub async fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<StageResult> {
+    run_check_kind(server_addr, target, config::TransportKind::Tls).await
 }
 
 fn skip(out: &mut Vec<StageResult>, names: &[&'static str]) {

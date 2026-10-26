@@ -12,9 +12,8 @@ path = "src/main.rs"
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 transport-tls = { path = "../../crates/transport-tls" }
+transport-manager = { path = "../../crates/transport-manager" }
+config = { path = "../../crates/config" }
 proxy-core = { path = "../../crates/proxy-core" }
 socks5 = { path = "../../crates/socks5" }
 tokio = { workspace = true }
-
-[dev-dependencies]
-config = { path = "../../crates/config" }

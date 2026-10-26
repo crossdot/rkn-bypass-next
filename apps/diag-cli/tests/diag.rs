@@ -1,4 +1,4 @@
-//! Интеграционный тест диагностики: недоступный хост → класс ошибки.
+//! Интеграционные тесты диагностики: класс ошибки, data-этап, транспорт.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -46,22 +46,33 @@ fn host_ipv4() -> Ipv4Addr {
     }
 }
 
-/// TLS-сервер, обслуживающий одно соединение с permissive-правилами.
+/// TLS-сервер, обслуживающий любое число соединений (проба + SOCKS5-этап)
+/// с permissive-правилами.
 async fn spawn_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = load_server_config();
+    let server_config = load_server_config();
     tokio::spawn(async move {
-        let (sock, _) = listener.accept().await.unwrap();
-        let server = ServerTransport::accept(sock, config, Duration::from_secs(5))
-            .await
-            .unwrap();
-        let rules = config::AddressRules::from_toml(
-            r#"[server.address_rules]
-            allow_cidrs = ["0.0.0.0/0"]"#,
-        )
-        .unwrap();
-        let _ = proxy_core::serve_server_connection(server, Duration::from_secs(3), &rules).await;
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let server_config = Arc::clone(&server_config);
+            tokio::spawn(async move {
+                let Ok(server) =
+                    ServerTransport::accept(sock, server_config, Duration::from_secs(5)).await
+                else {
+                    return;
+                };
+                let rules = config::AddressRules::from_toml(
+                    r#"[server.address_rules]
+                    allow_cidrs = ["0.0.0.0/0"]"#,
+                )
+                .unwrap();
+                let _ = proxy_core::serve_server_connection(server, Duration::from_secs(3), &rules)
+                    .await;
+            });
+        }
     });
     addr
 }
@@ -86,14 +97,58 @@ async fn diag_check_unreachable_host_reports_class() {
     assert_eq!(stages.len(), 4);
     assert_eq!(stages[0].name, "connect");
     assert_eq!(stages[0].status, diag_cli::StageStatus::Ok);
-    assert_eq!(stages[1].name, "tls");
+    assert_eq!(stages[1].name, "handshake");
     assert_eq!(stages[1].status, diag_cli::StageStatus::Ok);
-    assert_eq!(stages[2].name, "socks5");
+    // data-этап — реальный Ping/Pong, а не заглушка.
+    assert_eq!(stages[2].name, "data");
+    assert_eq!(stages[2].status, diag_cli::StageStatus::Ok);
+    assert_eq!(stages[3].name, "socks5");
     assert!(
-        matches!(&stages[2].status, diag_cli::StageStatus::Failed(s) if s.starts_with("connection-refused")),
+        matches!(&stages[3].status, diag_cli::StageStatus::Failed(s) if s.starts_with("connection-refused")),
         "expected connection-refused, got {:?}",
-        stages[2].status
+        stages[3].status
     );
-    assert_eq!(stages[3].name, "relay");
+}
+
+#[tokio::test]
+async fn diag_check_reports_transport_down() {
+    // Порт без слушателя: TCP refused → класс tls-refused, остальное пропущено.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let target = socks5::Target {
+        addr: socks5::Addr::IPv4([127, 0, 0, 1]),
+        port: 80,
+    };
+    let stages = diag_cli::run_check(addr, &target).await;
+
+    assert_eq!(stages[0].name, "connect");
+    assert!(
+        matches!(&stages[0].status, diag_cli::StageStatus::Failed(s) if s == "tls-refused"),
+        "expected tls-refused, got {:?}",
+        stages[0].status
+    );
+    assert_eq!(stages[1].name, "handshake");
+    assert_eq!(stages[1].status, diag_cli::StageStatus::Skipped);
+    assert_eq!(stages[2].status, diag_cli::StageStatus::Skipped);
     assert_eq!(stages[3].status, diag_cli::StageStatus::Skipped);
+}
+
+#[tokio::test]
+async fn diag_check_quic_against_tls_server_reports_udp_filtered() {
+    let server_addr = spawn_server().await;
+    let target = socks5::Target {
+        addr: socks5::Addr::IPv4([127, 0, 0, 1]),
+        port: 80,
+    };
+
+    let stages = diag_cli::run_check_kind(server_addr, &target, config::TransportKind::Quic).await;
+
+    assert_eq!(stages[0].name, "connect");
+    assert!(
+        matches!(&stages[0].status, diag_cli::StageStatus::Failed(s) if s == "udp-filtered"),
+        "expected udp-filtered, got {:?}",
+        stages[0].status
+    );
 }

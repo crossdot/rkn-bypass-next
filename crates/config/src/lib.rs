@@ -6,6 +6,7 @@
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -38,7 +39,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Транспорт, выбираемый конфигом: TLS (P4a) или QUIC (P4b).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     /// TLS (по умолчанию).
@@ -68,6 +69,159 @@ impl TransportKind {
     pub fn from_toml(s: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(s).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(raw.server.transport.unwrap_or_default())
+    }
+
+    /// Противоположный транспорт (tls ↔ quic).
+    pub fn alternate(self) -> Self {
+        match self {
+            Self::Tls => Self::Quic,
+            Self::Quic => Self::Tls,
+        }
+    }
+}
+
+/// Стратегия выбора транспорта (P5.3).
+///
+/// Клиент: `auto` — детерминированная политика «предпочтительный → fallback».
+/// Сервер: `auto` — слушать оба транспорта (TCP и UDP на одном адресе).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportStrategy {
+    /// Автоматически: клиент — `preferred` + fallback, сервер — оба транспорта.
+    #[default]
+    Auto,
+    /// Только TLS.
+    Tls,
+    /// Только QUIC.
+    Quic,
+}
+
+impl std::str::FromStr for TransportStrategy {
+    type Err = ConfigError;
+
+    /// Парсит `"auto"` / `"tls"` / `"quic"` (case-insensitive); env-значение.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "tls" => Ok(Self::Tls),
+            "quic" => Ok(Self::Quic),
+            other => Err(ConfigError::Parse(format!(
+                "unknown transport strategy {other:?} (expected \"auto\", \"tls\" or \"quic\")"
+            ))),
+        }
+    }
+}
+
+/// Политика выбора транспорта на клиенте (P5.3).
+///
+/// Детерминированная: явные таймауты, TTL кэша и backoff. Задержка
+/// транспорта **не участвует** в выборе — она только логируется, поэтому
+/// «скачок задержки» не может вызвать переключение.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPolicy {
+    /// `auto` | `tls` | `quic`.
+    pub strategy: TransportStrategy,
+    /// Первый транспорт в режиме `auto`.
+    pub preferred: TransportKind,
+    /// Таймаут одной сетевой операции пробы (connect и Ping/Pong — каждая).
+    pub probe_timeout: Duration,
+    /// TTL успешного результата: в пределах TTL проба не повторяется.
+    pub ttl: Duration,
+    /// Верхняя граница backoff после неудачи (она же negative-TTL).
+    pub fail_ttl: Duration,
+    /// Попыток одной пробы за один цикл выбора (минимум 1).
+    pub max_probe_attempts: u32,
+}
+
+impl Default for TransportPolicy {
+    fn default() -> Self {
+        Self {
+            strategy: TransportStrategy::Auto,
+            preferred: TransportKind::Tls,
+            probe_timeout: Duration::from_millis(2000),
+            ttl: Duration::from_secs(300),
+            fail_ttl: Duration::from_secs(30),
+            max_probe_attempts: 1,
+        }
+    }
+}
+
+impl TransportPolicy {
+    /// Читает политику из env; незаданные/пустые переменные → дефолт.
+    ///
+    /// `TRANSPORT`, `TRANSPORT_PREFERRED`, `TRANSPORT_PROBE_TIMEOUT_MS`,
+    /// `TRANSPORT_TTL_S`, `TRANSPORT_FAIL_TTL_S`, `TRANSPORT_PROBE_ATTEMPTS`.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_lookup(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+    }
+
+    /// Общий разбор из произвольного источника (тесты — без env).
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let d = Self::default();
+
+        let strategy = match get("TRANSPORT") {
+            Some(v) => v.parse()?,
+            None => d.strategy,
+        };
+        let preferred = match get("TRANSPORT_PREFERRED") {
+            Some(v) => v.parse()?,
+            None => d.preferred,
+        };
+        let probe_timeout = Duration::from_millis(number(
+            &get,
+            "TRANSPORT_PROBE_TIMEOUT_MS",
+            d.probe_timeout.as_millis() as u64,
+        )?);
+        let ttl = Duration::from_secs(number(&get, "TRANSPORT_TTL_S", d.ttl.as_secs())?);
+        let fail_ttl =
+            Duration::from_secs(number(&get, "TRANSPORT_FAIL_TTL_S", d.fail_ttl.as_secs())?);
+        let max_probe_attempts = number(
+            &get,
+            "TRANSPORT_PROBE_ATTEMPTS",
+            d.max_probe_attempts as u64,
+        )?;
+
+        if probe_timeout.is_zero() {
+            return Err(ConfigError::Parse(
+                "TRANSPORT_PROBE_TIMEOUT_MS must be > 0".into(),
+            ));
+        }
+        if max_probe_attempts == 0 || max_probe_attempts > u32::MAX as u64 {
+            return Err(ConfigError::Parse(
+                "TRANSPORT_PROBE_ATTEMPTS must be in 1..=u32::MAX".into(),
+            ));
+        }
+
+        Ok(Self {
+            strategy,
+            preferred,
+            probe_timeout,
+            ttl,
+            fail_ttl,
+            max_probe_attempts: max_probe_attempts as u32,
+        })
+    }
+
+    /// Порядок попыток: первый элемент — предпочтительный.
+    pub fn order(&self) -> Vec<TransportKind> {
+        match self.strategy {
+            TransportStrategy::Tls => vec![TransportKind::Tls],
+            TransportStrategy::Quic => vec![TransportKind::Quic],
+            TransportStrategy::Auto => vec![self.preferred, self.preferred.alternate()],
+        }
+    }
+}
+
+/// Читает неотрицательное целое из env-подобного источника.
+fn number(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    match get(name) {
+        None => Ok(default),
+        Some(v) => v.trim().parse::<u64>().map_err(|_| {
+            ConfigError::Parse(format!("{name} must be a non-negative integer, got {v:?}"))
+        }),
     }
 }
 
@@ -612,5 +766,83 @@ mod tests {
             TransportKind::from_toml("[server]\ntransport = \"quic\"\n").unwrap(),
             TransportKind::Quic
         );
+    }
+
+    #[test]
+    fn transport_strategy_parse() {
+        assert_eq!(
+            "auto".parse::<TransportStrategy>().unwrap(),
+            TransportStrategy::Auto
+        );
+        assert_eq!(
+            " TLS ".parse::<TransportStrategy>().unwrap(),
+            TransportStrategy::Tls
+        );
+        assert_eq!(
+            "quic".parse::<TransportStrategy>().unwrap(),
+            TransportStrategy::Quic
+        );
+        assert!("both".parse::<TransportStrategy>().is_err());
+    }
+
+    #[test]
+    fn policy_defaults_and_order() {
+        let p = TransportPolicy::default();
+        assert_eq!(p.strategy, TransportStrategy::Auto);
+        assert_eq!(p.preferred, TransportKind::Tls);
+        assert_eq!(p.order(), vec![TransportKind::Tls, TransportKind::Quic]);
+
+        let quic_first = TransportPolicy {
+            preferred: TransportKind::Quic,
+            ..p.clone()
+        };
+        assert_eq!(
+            quic_first.order(),
+            vec![TransportKind::Quic, TransportKind::Tls]
+        );
+
+        let fixed = TransportPolicy {
+            strategy: TransportStrategy::Tls,
+            preferred: TransportKind::Quic,
+            ..p
+        };
+        assert_eq!(
+            fixed.order(),
+            vec![TransportKind::Tls],
+            "strategy=tls игнорирует preferred"
+        );
+    }
+
+    #[test]
+    fn policy_from_lookup_parses_values() {
+        let vars = std::collections::HashMap::from([
+            ("TRANSPORT", "auto"),
+            ("TRANSPORT_PREFERRED", "quic"),
+            ("TRANSPORT_PROBE_TIMEOUT_MS", "1500"),
+            ("TRANSPORT_TTL_S", "60"),
+            ("TRANSPORT_FAIL_TTL_S", "10"),
+            ("TRANSPORT_PROBE_ATTEMPTS", "3"),
+        ]);
+        let p = TransportPolicy::from_lookup(|k| vars.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(p.strategy, TransportStrategy::Auto);
+        assert_eq!(p.preferred, TransportKind::Quic);
+        assert_eq!(p.probe_timeout, Duration::from_millis(1500));
+        assert_eq!(p.ttl, Duration::from_secs(60));
+        assert_eq!(p.fail_ttl, Duration::from_secs(10));
+        assert_eq!(p.max_probe_attempts, 3);
+        assert_eq!(p.order(), vec![TransportKind::Quic, TransportKind::Tls]);
+    }
+
+    #[test]
+    fn policy_rejects_invalid_values() {
+        let bad = |k: &'static str, v: &'static str| {
+            TransportPolicy::from_lookup(move |name| (name == k).then(|| v.to_string()))
+        };
+        assert!(bad("TRANSPORT_PROBE_TIMEOUT_MS", "0").is_err());
+        assert!(bad("TRANSPORT_PROBE_ATTEMPTS", "0").is_err());
+        assert!(bad("TRANSPORT_TTL_S", "-1").is_err());
+        assert!(bad("TRANSPORT", "both").is_err());
+        assert!(bad("TRANSPORT_PREFERRED", "udp").is_err());
+        assert!(bad("TRANSPORT_PROBE_ATTEMPTS", "999999999999").is_err());
     }
 }

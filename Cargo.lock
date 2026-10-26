@@ -138,7 +138,10 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "transport-any",
+ "transport-manager",
  "transport-quic",
  "transport-tls",
 ]
@@ -216,6 +219,7 @@ dependencies = [
  "rustls-pemfile",
  "socks5",
  "tokio",
+ "transport-manager",
  "transport-tls",
 ]
 
@@ -1069,6 +1073,26 @@ name = "transport-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+]
+
+[[package]]
+name = "transport-manager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "config",
+ "protocol",
+ "proxy-core",
+ "rustls",
+ "rustls-pemfile",
+ "socks5",
+ "tokio",
+ "tracing",
+ "tracing-test",
+ "transport-any",
+ "transport-api",
+ "transport-quic",
+ "transport-tls",
 ]
 
 [[package]]

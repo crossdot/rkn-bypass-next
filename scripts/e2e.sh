@@ -36,26 +36,32 @@ PIDS+=($!)
 sleep 0.5
 
 run_case() {
-  local transport="$1" server_port="$2"
-  echo "=== transport=$transport ==="
+  local label="$1" server_transport="$2" client_transport="$3" server_port="$4"
+  local expect_log="${5:-}"
+  local tag="$label"
+  echo "=== $label: server=$server_transport client=$client_transport ${CLIENT_ENV:-} ==="
 
-  TRANSPORT="$transport" LISTEN_ADDR="127.0.0.1:$server_port" \
+  TRANSPORT="$server_transport" LISTEN_ADDR="127.0.0.1:$server_port" \
     CLIENTS_PATH="$TMP/clients.toml" RULES_PATH="$TMP/rules.toml" \
-    "$BIN/server" >"$TMP/server-$transport.log" 2>&1 &
+    "$BIN/server" >"$TMP/server-$tag.log" 2>&1 &
   local server_pid=$!
   PIDS+=($server_pid)
 
-  TRANSPORT="$transport" LISTEN_ADDR="127.0.0.1:11080" \
+  env TRANSPORT="$client_transport" LISTEN_ADDR="127.0.0.1:11080" \
     SERVER_ADDR="127.0.0.1:$server_port" \
     CLIENT_CERT="$CLIENT_CERT" CLIENT_KEY="$TMP/client.key" \
-    "$BIN/client" >"$TMP/client-$transport.log" 2>&1 &
+    ${CLIENT_ENV:-} \
+    "$BIN/client" >"$TMP/client-$tag.log" 2>&1 &
   local client_pid=$!
   PIDS+=($client_pid)
 
-  # ждём, пока оба поднимутся
+  # ждём, пока оба поднимутся; при `auto` сервер печатает два "listening"
+  # (TLS-цикл стартует раньше QUIC — иначе проба QUIC может попасть в гонку).
+  local want=1
+  [[ "$server_transport" == "auto" ]] && want=2
   for _ in $(seq 1 50); do
-    if grep -q "listening" "$TMP/server-$transport.log" 2>/dev/null &&
-       grep -q "listening" "$TMP/client-$transport.log" 2>/dev/null; then
+    if [[ "$(grep -c "listening" "$TMP/server-$tag.log" 2>/dev/null || true)" -ge "$want" ]] &&
+       grep -q "listening" "$TMP/client-$tag.log" 2>/dev/null; then
       break
     fi
     sleep 0.1
@@ -63,19 +69,38 @@ run_case() {
 
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' \
-    --socks5 "127.0.0.1:11080" "http://$HOST_IP:$HTTP_PORT/" --max-time 15)"
+    --socks5 "127.0.0.1:11080" "http://$HOST_IP:$HTTP_PORT/" --max-time 20 || true)"
 
   kill "$client_pid" "$server_pid" 2>/dev/null || true
   wait "$client_pid" "$server_pid" 2>/dev/null || true
 
   echo "HTTP code: $code"
   if [[ "$code" != "200" ]]; then
-    echo "--- server log ---"; cat "$TMP/server-$transport.log"
-    echo "--- client log ---"; cat "$TMP/client-$transport.log"
+    echo "--- server log ---"; cat "$TMP/server-$tag.log"
+    echo "--- client log ---"; cat "$TMP/client-$tag.log"
     return 1
   fi
+  if [[ -n "$expect_log" ]]; then
+    if ! grep -q -- "$expect_log" "$TMP/client-$tag.log"; then
+      echo "expected client log to contain: $expect_log"
+      echo "--- client log ---"; cat "$TMP/client-$tag.log"
+      return 1
+    fi
+    echo "client log: $(grep -o 'event=transport_selected.*' "$TMP/client-$tag.log" | tail -1)"
+  fi
+  CLIENT_ENV=""
 }
 
-run_case tls 18443
-run_case quic 18443
-echo "E2E OK (tls + quic)"
+run_case manual-tls tls tls 18443
+run_case manual-quic quic quic 18443
+# auto на обоих: TLS-first, проба проходит, транспорт = tls.
+run_case auto-default auto auto 18443 "event=transport_selected transport=tls reason=probe_ok"
+# dual-listen: тот же сервер отвечает по QUIC (ручной выбор транспорта).
+run_case dual-listen-manual-quic auto quic 18443
+# auto с preferred=quic на dual-listen: QUIC проходит пробу и выбирается.
+CLIENT_ENV="TRANSPORT_PREFERRED=quic"
+run_case auto-preferred-quic auto auto 18443 "event=transport_selected transport=quic reason=probe_ok"
+# UDP недоступен (сервер только TLS), preferred=quic → fallback на TLS с причиной.
+CLIENT_ENV="TRANSPORT_PREFERRED=quic TRANSPORT_PROBE_TIMEOUT_MS=1000"
+run_case auto-fallback-udp tls auto 18443 "event=transport_selected transport=tls reason=udp_filtered"
+echo "E2E OK (manual tls/quic + auto + dual-listen + fallback)"

@@ -137,7 +137,14 @@ impl Transport for QuicClientTransport {
         if let Some(conn) = self.conn.take() {
             conn.close(0u32.into(), b"");
         }
-        self.endpoint.wait_idle().await;
+        // Дренирование после CONNECTION_CLOSE — ≈3×PTO (~90 мс) — не должно
+        // блокировать вызывающего. Отдаём клон endpoint фоновой задаче: она
+        // держит driver живым, пока фрейм закрытия не уйдёт и соединение не
+        // станет idle, после чего отпускает сокет.
+        let endpoint = self.endpoint.clone();
+        tokio::spawn(async move {
+            endpoint.wait_idle().await;
+        });
         Ok(())
     }
 }

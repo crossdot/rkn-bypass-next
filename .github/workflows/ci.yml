@@ -35,6 +35,27 @@ jobs:
       - name: cargo build
         run: cargo build
 
+  e2e:
+    name: e2e (tls + quic + auto + fallback)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --workspace
+
+      # Отдельный job: не замедляет check; ловит регрессии политики выбора
+      # транспорта (ADR-023) — manual tls/quic, auto, dual-listen, UDP fallback.
+      - name: Run e2e (ADR-023)
+        run: bash scripts/e2e.sh
+
   docker-smoke:
     name: docker build + smoke + SBOM + sign (ADR-011)
     runs-on: ubuntu-latest

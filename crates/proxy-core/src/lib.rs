@@ -315,7 +315,27 @@ pub async fn serve_server_connection<T: Transport>(
     connect_timeout: Duration,
     rules: &config::AddressRules,
 ) -> Result<(), ProxyError> {
-    let target = read_connect_target(&mut server).await?;
+    // Ping/Pong (P5.3): доказательство живости data-path, а не только
+    // handshake. Сервер эхом повторяет payload и закрывает соединение.
+    // Проверка идёт до CONNECT и адресных правил — цель не нужна.
+    let message = protocol::read_message(&mut server).await?;
+    if message.kind == protocol::MessageKind::Ping {
+        protocol::write_message(
+            &mut server,
+            &protocol::Message::new(protocol::MessageKind::Pong, message.payload),
+        )
+        .await?;
+        // Не рвём соединение сразу: у QUIC закрытие конкурирует с доставкой
+        // только что записанного STREAM-фрейма, и клиент увидел бы
+        // «connection lost» вместо Pong. Ждём закрытия клиентом (не дольше 1 с).
+        let mut buf = [0u8; 1];
+        let _ = tokio::time::timeout(Duration::from_secs(1), server.recv(&mut buf)).await;
+        return Ok(());
+    }
+    if message.kind != protocol::MessageKind::Connect {
+        return Err(ProxyError::UnexpectedMessage(message.kind));
+    }
+    let (target, _) = socks5::Target::decode(&message.payload)?;
     let ips = resolve_target_ips(&target).await?;
 
     // Проверка адресных правил (SSRF) до подключения.

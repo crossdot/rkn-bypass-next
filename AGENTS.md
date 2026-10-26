@@ -54,6 +54,22 @@ Rust/Linux-система устойчивого обхода блокирово
   пока не доказано, что resumed-сессии проходят клиентскую
   аутентификацию и аудит.
 
+## Политика выбора транспорта (P5.3, ADR-023)
+- Дефолт клиента — `TRANSPORT=auto`: TLS-first, serial, fallback на QUIC.
+  `preferred=quic` — только явным конфигом.
+- Проба доступности обязана включать передачу данных (Ping/Pong, 1 байт),
+  а не только handshake. Handshake-only не считается «транспорт работает».
+- Задержка не участвует в выборе. Никаких ML/эвристик; только явные пороги
+  (TTL, backoff, `max_probe_attempts`).
+- При тотальном отказе возвращается `preferred` с `reason=all_failed_default`,
+  а не «последний успешный» — иначе осцилляция при флапе.
+- Проба идёт через mTLS и session-limit: обход `verify_client_cert` / аудита
+  недопустим (ADR-021).
+- Сервер `TRANSPORT=auto` (дефолт) слушает TCP+UDP; `SessionManager`, реестр
+  клиентов и `inner`-верификатор общие — `max_sessions` глобальный,
+  не per-transport.
+- diag-cli использует `transport-manager`, а не свою копию проверки.
+
 ## Режимы клиента (три независимые оси)
 - `mode`: `socks5` — MVP и обязательный; `tun` — Phase 2, в MVP его нет.
 - `entry`: `none` — MVP по умолчанию; `wireguard` — MVP, опционально (AmneziaWG, не голый WireGuard).

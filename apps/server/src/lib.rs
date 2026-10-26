@@ -12,6 +12,7 @@ use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{DigitallySignedStruct, DistinguishedName, Error, RootCertStore, SignatureScheme};
+use transport_any::AnyServerTransport;
 
 /// mTLS-верификатор: проверяет цепочку через `WebPkiClientVerifier` и
 /// дополнительно — что fingerprint сертификата известен и не отозван.
@@ -171,6 +172,69 @@ impl SessionManager {
         let mut counts = self.counts.lock().unwrap();
         if let Some(n) = counts.get_mut(fingerprint) {
             *n = n.saturating_sub(1);
+        }
+    }
+}
+
+/// Общие сервисы per-connection пути, разделяемые TLS- и QUIC-циклами.
+///
+/// Один экземпляр на процесс (см. `run_both`), поэтому `max_sessions`
+/// считается глобально, а реестр и аудит не дублируются по транспортам
+/// (ADR-023 §8).
+#[derive(Debug)]
+pub struct Services {
+    /// Реестр известных клиентов.
+    pub registry: Arc<config::ClientRegistry>,
+    /// Глобальный счётчик активных сессий (общий для TLS и QUIC).
+    pub sessions: Arc<SessionManager>,
+    /// Адресные правила назначения.
+    pub rules: config::AddressRules,
+}
+
+impl Services {
+    /// Собирает сервисы из реестра, счётчика сессий и адресных правил.
+    pub fn new(
+        registry: Arc<config::ClientRegistry>,
+        sessions: Arc<SessionManager>,
+        rules: config::AddressRules,
+    ) -> Self {
+        Self {
+            registry,
+            sessions,
+            rules,
+        }
+    }
+
+    /// Общий per-connection путь: идентичность → лимит сессий → проксирование.
+    ///
+    /// Транспорт абстрагирован [`AnyServerTransport`], поэтому mTLS, аудит и
+    /// `serve_server_connection` не дублируются между TLS и QUIC.
+    pub async fn handle(&self, transport: AnyServerTransport) {
+        let Some(der) = transport.peer_certificate_der() else {
+            return; // не случится при обязательном mTLS
+        };
+        let fp = crypto::fingerprint(&der);
+        let short = &fp[..12];
+        let max = self
+            .registry
+            .find_by_fingerprint(&fp)
+            .and_then(|e| e.max_sessions);
+
+        if self.sessions.try_acquire(&fp, max) {
+            eprintln!("client {short} connected");
+            if let Err(e) = proxy_core::serve_server_connection(
+                transport,
+                proxy_core::CONNECT_TIMEOUT,
+                &self.rules,
+            )
+            .await
+            {
+                eprintln!("client {short} connection error: {e}");
+            }
+            self.sessions.release(&fp);
+        } else {
+            eprintln!("client {short} session limit reached");
+            drop(transport);
         }
     }
 }

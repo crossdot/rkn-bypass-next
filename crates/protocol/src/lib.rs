@@ -39,6 +39,14 @@ pub enum MessageKind {
     Connect = 0x02,
     /// Подтверждение CONNECT: REP-код (payload 1 байт) сервер → клиент.
     ConnectAck = 0x03,
+    /// Проверка живости data-path (P5.3): payload 1 байт клиент → сервер.
+    ///
+    /// Сервер отвечает [`MessageKind::Pong`] с тем же payload и закрывает
+    /// соединение. Используется политикой выбора транспорта как доказательство
+    /// передачи данных, а не только handshake.
+    Ping = 0x04,
+    /// Ответ на [`MessageKind::Ping`]: payload эхом повторяет Ping.
+    Pong = 0x05,
 }
 
 impl MessageKind {
@@ -50,6 +58,8 @@ impl MessageKind {
             0x01 => Ok(Self::Control),
             0x02 => Ok(Self::Connect),
             0x03 => Ok(Self::ConnectAck),
+            0x04 => Ok(Self::Ping),
+            0x05 => Ok(Self::Pong),
             other => Err(ProtocolError::UnknownMessageKind(other)),
         }
     }
@@ -272,6 +282,17 @@ mod tests {
         let (dec, consumed) = Message::decode(&enc).unwrap();
         assert_eq!(dec, m);
         assert_eq!(consumed, enc.len());
+    }
+
+    #[test]
+    fn ping_pong_kinds_roundtrip() {
+        for kind in [MessageKind::Ping, MessageKind::Pong] {
+            let m = Message::new(kind, vec![0x01]);
+            let enc = m.encode().unwrap();
+            let (dec, consumed) = Message::decode(&enc).unwrap();
+            assert_eq!(dec, m);
+            assert_eq!(consumed, enc.len());
+        }
     }
 
     #[test]
