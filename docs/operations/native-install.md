@@ -133,6 +133,13 @@ systemd-analyze security rkn-client.service          # exposure < 5.0
 
 ## 3. Hardening и диагностика
 
+> **Оговорка (runtime не проверен):** `SystemCallFilter=@system-service`
+> проверен `systemd-analyze --offline`, но **не runtime** (unit не запускался
+> на целевой). При первом запуске на целевой:
+> `journalctl -u rkn-server | grep -i sigsys`; если SIGSYS — fallback
+> `SystemCallFilter=@system-service @network-io` (ADR-026 §6). CI покрывает
+> offline-score + e2e, но не runtime-фильтр.
+
 - Score: `rkn-server` 1.9, `rkn-client` 1.8 (`--offline=true`), цель < 5.0.
 - **SIGSYS в journalctl** (фильтр сисколлов сломал бинарник):
   в unit заменить `SystemCallFilter=@system-service` на
