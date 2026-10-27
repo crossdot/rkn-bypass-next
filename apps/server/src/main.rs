@@ -184,6 +184,31 @@ async fn run_both(
     Ok(())
 }
 
+/// Если задан `TASK_METRICS_INTERVAL_S`, периодически пишет
+/// `event=task_metrics alive_tasks=<n>` (tokio `Handle::metrics()`).
+/// Только для нагрузочных испытаний (P11); по умолчанию выключено.
+fn spawn_task_metrics() {
+    let Ok(raw) = std::env::var("TASK_METRICS_INTERVAL_S") else {
+        return;
+    };
+    let Ok(secs) = raw.parse::<u64>() else {
+        return;
+    };
+    if secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            tick.tick().await;
+            let alive_tasks = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+            tracing::info!(event = %"task_metrics", alive_tasks = alive_tasks);
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crypto_provider();
@@ -200,6 +225,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // цвет только на терминале (ADR-021/ADR-023).
         .with_ansi(std::io::stderr().is_terminal())
         .init();
+
+    spawn_task_metrics();
 
     let strategy = match std::env::var("TRANSPORT") {
         Ok(v) => v.parse::<config::TransportStrategy>()?,

@@ -56,6 +56,28 @@ jobs:
       - name: Run e2e (ADR-023)
         run: bash scripts/e2e.sh
 
+  load-smoke:
+    name: load smoke (P11)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      # Отдельный job (не замедляет check): дымовой нагрузочный прогон P11.
+      # Скрипт сам стартует server+client, гонит 10 воркеров 30с и падает
+      # при ошибках / росте fd/tasks.
+      - name: Load smoke (P11)
+        run: bash scripts/load.sh --clients 10 --transport auto --duration 30 --scenario basic
+
   docker-smoke:
     name: docker build + smoke + SBOM + sign (ADR-011)
     runs-on: ubuntu-latest
