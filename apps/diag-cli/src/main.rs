@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 || args[1] != "check" {
-        eprintln!("usage: diag-cli check <host>:<port> [--transport tls|quic]");
+        eprintln!("usage: diag-cli check <host>:<port> [--transport tls|quic] [--json]");
         std::process::exit(2);
     }
     let target = match diag_cli::parse_target(&args[2]) {
@@ -19,6 +19,7 @@ async fn main() {
 
     // `--transport` (иначе `DIAG_TRANSPORT`, иначе TLS).
     let mut transport = std::env::var("DIAG_TRANSPORT").unwrap_or_else(|_| "tls".to_string());
+    let mut json_out = false;
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -29,6 +30,10 @@ async fn main() {
                 };
                 transport = v.clone();
                 i += 2;
+            }
+            "--json" => {
+                json_out = true;
+                i += 1;
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -55,21 +60,30 @@ async fn main() {
         Err(_) => diag_cli::DEFAULT_SERVER_ADDR.parse().unwrap(),
     };
 
-    println!(
-        "diag check {} -> server {server_addr} (transport={kind:?})",
-        args[2]
-    );
-    for (i, stage) in diag_cli::run_check_kind(server_addr, &target, kind)
-        .await
-        .iter()
-        .enumerate()
-    {
-        match &stage.status {
-            diag_cli::StageStatus::Ok => println!("[{}] {:<10} OK", i + 1, stage.name),
-            diag_cli::StageStatus::Failed(cls) => {
-                println!("[{}] {:<10} FAIL: {cls}", i + 1, stage.name)
+    let stages = diag_cli::run_check_kind(server_addr, &target, kind).await;
+    if json_out {
+        println!("{}", diag_cli::stages_to_json(&args[2], kind, &stages));
+    } else {
+        println!(
+            "diag check {} -> server {server_addr} (transport={kind:?})",
+            args[2]
+        );
+        for (i, stage) in stages.iter().enumerate() {
+            match &stage.status {
+                diag_cli::StageStatus::Ok => println!("[{}] {:<10} OK", i + 1, stage.name),
+                diag_cli::StageStatus::Failed(cls) => {
+                    println!("[{}] {:<10} FAIL: {cls}", i + 1, stage.name)
+                }
+                diag_cli::StageStatus::Skipped => {
+                    println!("[{}] {:<10} skipped", i + 1, stage.name)
+                }
             }
-            diag_cli::StageStatus::Skipped => println!("[{}] {:<10} skipped", i + 1, stage.name),
         }
+    }
+    if stages
+        .iter()
+        .any(|s| matches!(s.status, diag_cli::StageStatus::Failed(_)))
+    {
+        std::process::exit(1);
     }
 }

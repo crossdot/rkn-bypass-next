@@ -78,6 +78,11 @@ jobs:
       - name: Load smoke (P11)
         run: bash scripts/load.sh --clients 10 --transport auto --duration 30 --scenario basic
 
+      # Полевой стенд P5.2: в CI только --dry-run (нужны реальные сим-карты).
+      # Валидирует аргументы, наличие release-бинарников и печатает план.
+      - name: field-test dry-run (P5.2)
+        run: bash scripts/field-test.sh --operator CI --region smoke --access 4g --device android --host 127.0.0.1:8443 --client-cert certs/dev-server.crt --client-key certs/dev-server.key --ca certs/dev-ca.crt --out target/field-out --dry-run
+
   systemd-hardening:
     name: systemd hardening (P8)
     runs-on: ubuntu-latest

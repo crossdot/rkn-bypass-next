@@ -5,7 +5,16 @@
 # Usage:
 #   scripts/load.sh --clients N --transport tls|quic|auto --duration S \
 #                   [--target URL] [--out FILE] [--scenario NAME] \
-#                   [--max-sessions M]
+#                   [--max-sessions M] \
+#                   [--remote <host:port>] [--client-cert F] [--client-key F] \
+#                   [--ca F] [--dry-run]
+#
+# --remote: полевой режим. Не поднимает локальный сервер и target; клиент
+#           стартует локально, но идёт на удалённый сервер с реальным mTLS
+#           (--client-cert/--client-key/--ca) и гонит трафик на --target URL.
+#           Только --scenario basic. fetch --transport tls/quic/auto.
+# --dry-run: валидирует аргументы и печатает план, ничего не запускает
+#           (используется в CI и для проверки ветки --remote).
 #
 # Scenarios:
 #   basic     — N воркеров, закрытый цикл запросов, p50/p95/p99, fd/RSS/tasks.
@@ -34,6 +43,11 @@ OUT=""
 SCENARIO=basic
 MAX_SESSIONS=""
 REQ_TIMEOUT="${REQ_TIMEOUT:-30}"
+REMOTE=""
+CLIENT_CERT_PATH=""
+CLIENT_KEY_PATH=""
+CA_PATH=""
+DRY_RUN=0
 
 usage() {
   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
@@ -48,14 +62,44 @@ while [ $# -gt 0 ]; do
     --out) OUT="$2"; shift 2 ;;
     --scenario) SCENARIO="$2"; shift 2 ;;
     --max-sessions) MAX_SESSIONS="$2"; shift 2 ;;
+    --remote) REMOTE="$2"; shift 2 ;;
+    --client-cert) CLIENT_CERT_PATH="$2"; shift 2 ;;
+    --client-key) CLIENT_KEY_PATH="$2"; shift 2 ;;
+    --ca) CA_PATH="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
 
-if [ ! -x "$BIN/server" ] || [ ! -x "$BIN/client" ] || [ ! -x "$BIN/admin-cli" ]; then
+if [ ! -x "$BIN/client" ]; then
   echo "release binaries not found under $BIN (run: cargo build --release --workspace)" >&2
   exit 1
+fi
+if [ -z "$REMOTE" ]; then
+  if [ ! -x "$BIN/server" ] || [ ! -x "$BIN/admin-cli" ]; then
+    echo "release binaries not found under $BIN (run: cargo build --release --workspace)" >&2
+    exit 1
+  fi
+fi
+
+# --remote: полевой режим.
+if [ -n "$REMOTE" ]; then
+  if [ -z "$CLIENT_CERT_PATH" ] || [ -z "$CLIENT_KEY_PATH" ] || [ -z "$CA_PATH" ]; then
+    echo "[load] --remote requires --client-cert, --client-key, --ca" >&2
+    exit 2
+  fi
+  if [ -z "$TARGET" ]; then
+    echo "[load] --remote requires --target <url> (real target site)" >&2
+    exit 2
+  fi
+  if [ "$SCENARIO" != "basic" ]; then
+    echo "[load] --remote supports only --scenario basic (field use); got '$SCENARIO'" >&2
+    exit 2
+  fi
+  for f in "$CLIENT_CERT_PATH" "$CLIENT_KEY_PATH" "$CA_PATH"; do
+    [ -f "$f" ] || { echo "[load] --remote: $f not found" >&2; exit 2; }
+  done
 fi
 
 TMP="$(mktemp -d)"
@@ -78,13 +122,34 @@ SUMMARY=""
 emit() { echo "$*"; SUMMARY+="$*"$'\n'; }
 log() { echo "[load] $*" >&2; }
 
+# --dry-run: валидация уже прошла; печатаем план и выходим, ничего не запуская.
+if [ "$DRY_RUN" -ne 0 ]; then
+  if [ -n "$REMOTE" ]; then
+    echo "[dry-run] remote client -> SERVER_ADDR=$REMOTE transport=$TRANSPORT scenario=$SCENARIO clients=$CLIENTS duration=${DURATION}s target=$TARGET"
+    echo "[dry-run]   client-cert=$CLIENT_CERT_PATH client-key=$CLIENT_KEY_PATH ca=$CA_PATH"
+  else
+    echo "[dry-run] local server+client transport=$TRANSPORT scenario=$SCENARIO clients=$CLIENTS duration=${DURATION}s target=${TARGET:-http://$HOST_IP:$HTTP_PORT/}"
+  fi
+  echo "[dry-run]   workers=$CLIENTS x curl --socks5-hostname 127.0.0.1:$PROXY_PORT --max-time $REQ_TIMEOUT <target>"
+  echo "[dry-run] OK (nothing launched)"
+  exit 0
+fi
+
 # ---------- cert/registry/rules ----------
-CLIENTS_PATH="$TMP/clients.toml"
-CLIENTS_DIR="$TMP/clients"
-export CLIENTS_PATH CLIENTS_DIR
-"$BIN/admin-cli" client add load >"$TMP/key.out"
-sed -n '/-----BEGIN/,/-----END/p' "$TMP/key.out" >"$TMP/client.key"
-CLIENT_CERT="$TMP/clients/load.crt"
+CLIENT_CERT="$CLIENT_CERT_PATH"
+CLIENT_KEY_FILE="$CLIENT_KEY_PATH"
+CA_FILE="$CA_PATH"
+if [ -z "$REMOTE" ]; then
+  CLIENTS_PATH="$TMP/clients.toml"
+  CLIENTS_DIR="$TMP/clients"
+  export CLIENTS_PATH CLIENTS_DIR
+  "$BIN/admin-cli" client add load >"$TMP/key.out"
+  sed -n '/-----BEGIN/,/-----END/p' "$TMP/key.out" >"$TMP/client.key"
+  CLIENT_CERT="$TMP/clients/load.crt"
+  CLIENT_KEY_FILE="$TMP/client.key"
+  CA_FILE=""
+  printf '[server.address_rules]\nallow_cidrs = ["%s/32"]\n' "$HOST_IP" >"$TMP/rules.toml"
+fi
 
 apply_max_sessions() {
   [ -z "$MAX_SESSIONS" ] && return 0
@@ -94,9 +159,7 @@ apply_max_sessions() {
     printf 'max_sessions = %s\n' "$MAX_SESSIONS" >>"$CLIENTS_PATH"
   fi
 }
-apply_max_sessions
-
-printf '[server.address_rules]\nallow_cidrs = ["%s/32"]\n' "$HOST_IP" >"$TMP/rules.toml"
+[ -z "$REMOTE" ] && apply_max_sessions
 
 # ---------- metrics helpers ----------
 fd_count() { ls "/proc/$1/fd" 2>/dev/null | wc -l; }
@@ -142,12 +205,21 @@ aggregate() { # logdir duration label
 
 report_transport_selected() { # client log
   local logf="$1"
-  local total manual probe cached
-  total=$(grep -c "event=transport_selected" "$logf" 2>/dev/null || true)
-  manual=$(grep -o "reason=manual" "$logf" 2>/dev/null | wc -l || true)
-  probe=$(grep -o "reason=probe_ok" "$logf" 2>/dev/null | wc -l || true)
-  cached=$(grep -o "reason=cached_ok" "$logf" 2>/dev/null | wc -l || true)
-  emit "transport_selected: total=${total:-0} manual=$manual probe_ok=$probe cached_ok=$cached"
+  local sel; sel=$(grep "event=transport_selected" "$logf" 2>/dev/null || true)
+  local total manual probe cached udp tl rej fb fp
+  total=$([ -n "$sel" ] && printf '%s\n' "$sel" | grep -c . || true)
+  cnt() { [ -n "$sel" ] && printf '%s\n' "$sel" | grep -o "$1" 2>/dev/null | wc -l || true; }
+  manual=$(cnt "reason=manual")
+  probe=$(cnt "reason=probe_ok")
+  cached=$(cnt "reason=cached_ok")
+  udp=$(cnt "reason=udp_filtered")
+  tl=$(cnt "reason=tls_refused")
+  rej=$(cnt "reason=server_unreachable")
+  fb=$(cnt "reason=all_failed_default")
+  fp=$(cnt "reason=fallback_prev_failed")
+  local trs
+  trs=$(printf '%s\n' "$sel" | grep -oE 'transport=[a-z-]+' | sed 's/transport=//' | sort -u | paste -sd, -)
+  emit "transport_selected: total=${total:-0} manual=$manual probe_ok=$probe cached_ok=$cached udp_filtered=$udp tls_refused=$tl server_unreachable=$rej all_failed_default=$fb fallback_prev_failed=$fp transports=${trs:-?}"
 }
 
 report_tasks() { # pid log file
@@ -183,9 +255,12 @@ start_server() { # transport
 }
 start_client() { # transport proxy_port
   CLIENT_LOG="$TMP/client-$2.log"
-  TRANSPORT="$1" LISTEN_ADDR="127.0.0.1:$2" SERVER_ADDR="127.0.0.1:$SRV_PORT" \
-    CLIENT_CERT="$CLIENT_CERT" CLIENT_KEY="$TMP/client.key" \
-    TASK_METRICS_INTERVAL_S=1 RUST_LOG="${RUST_LOG:-info}" \
+  local srv="${REMOTE:-127.0.0.1:$SRV_PORT}"
+  local extra=()
+  [ -n "$CA_FILE" ] && extra+=(CA_PATH="$CA_FILE")
+  env TRANSPORT="$1" LISTEN_ADDR="127.0.0.1:$2" SERVER_ADDR="$srv" \
+    CLIENT_CERT="$CLIENT_CERT" CLIENT_KEY="$CLIENT_KEY_FILE" \
+    "${extra[@]}" TASK_METRICS_INTERVAL_S=1 RUST_LOG="${RUST_LOG:-info}" \
     "$BIN/client" >"$CLIENT_LOG" 2>&1 &
   CLIENT_PID=$!; PIDS+=("$CLIENT_PID")
 }
@@ -194,8 +269,12 @@ wait_ready() { # want_listenings
   local want="$1"
   for _ in $(seq 1 100); do
     local n
-    n=$(grep -c listening "$SERVER_LOG" 2>/dev/null || true)
-    n=${n:-0}
+    if [ -z "$REMOTE" ]; then
+      n=$(grep -c listening "$SERVER_LOG" 2>/dev/null || true)
+      n=${n:-0}
+    else
+      n="$want"
+    fi
     if [ "$n" -ge "$want" ] && grep -q listening "$CLIENT_LOG" 2>/dev/null; then
       return 0
     fi
@@ -302,30 +381,37 @@ run_workers() { # n proxy dur tag target
 
 # ---------- scenarios ----------
 scenario_basic() {
-  start_http_target
   local tgt="${TARGET:-http://$HOST_IP:$HTTP_PORT/}"
-  start_server "$TRANSPORT"
-  local want=1; [ "$TRANSPORT" = auto ] && want=2
+  local want=1
+  if [ -z "$REMOTE" ]; then
+    start_http_target
+    start_server "$TRANSPORT"
+    [ "$TRANSPORT" = auto ] && want=2
+  fi
   start_client "$TRANSPORT" "$PROXY_PORT"
   wait_ready "$want" || { log "server/client not ready"; tail -n 5 "$SERVER_LOG" || true; tail -n 5 "$CLIENT_LOG" || true; exit 1; }
 
   local before before_cli; before=$(snap "$SERVER_PID"); before_cli=$(snap "$CLIENT_PID")
-  sample_start "$SERVER_PID" "$TMP/sample-srv"; sample_start "$CLIENT_PID" "$TMP/sample-cli"
+  if [ -z "$REMOTE" ]; then sample_start "$SERVER_PID" "$TMP/sample-srv"; fi
+  sample_start "$CLIENT_PID" "$TMP/sample-cli"
   run_workers "$CLIENTS" "$PROXY_PORT" "$DURATION" basic "$tgt"
-  sample_stop "$TMP/sample-srv"; sample_stop "$TMP/sample-cli"
+  if [ -z "$REMOTE" ]; then sample_stop "$TMP/sample-srv"; fi
+  sample_stop "$TMP/sample-cli"
 
   aggregate "$TMP/wlogs-basic" "$DURATION" "basic transport=$TRANSPORT clients=$CLIENTS"
   report_transport_selected "$CLIENT_LOG"
-  report_tasks "$SERVER_PID" "$SERVER_LOG"
-  read -r smax sfmax stmax <<<"$(sample_max "$TMP/sample-srv")"
-  emit "server_during_max: rss=${smax}kB fd=$sfmax tasks=$stmax"
+  if [ -z "$REMOTE" ]; then
+    report_tasks "$SERVER_PID" "$SERVER_LOG"
+    read -r smax sfmax stmax <<<"$(sample_max "$TMP/sample-srv")"
+    emit "server_during_max: rss=${smax}kB fd=$sfmax tasks=$stmax"
+    local bfd; bfd=$(awk '{print $2}' <<<"$before")
+    wait_drain "$SERVER_PID" "$bfd" 20 || true
+    leak_check "server" "$before" "$(snap "$SERVER_PID")"
+  fi
   read -r cmax cfmax ctmax <<<"$(sample_max "$TMP/sample-cli")"
   emit "client_during_max: rss=${cmax}kB fd=$cfmax tasks=$ctmax"
-  local bfd bfd_cli
-  bfd=$(awk '{print $2}' <<<"$before"); bfd_cli=$(awk '{print $2}' <<<"$before_cli")
-  wait_drain "$SERVER_PID" "$bfd" 20 || true
+  local bfd_cli; bfd_cli=$(awk '{print $2}' <<<"$before_cli")
   wait_drain "$CLIENT_PID" "$bfd_cli" 10 || true
-  leak_check "server" "$before" "$(snap "$SERVER_PID")"
   leak_check "client" "$before_cli" "$(snap "$CLIENT_PID")"
 }
 

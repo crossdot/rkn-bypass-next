@@ -267,6 +267,87 @@ pub async fn run_check(server_addr: SocketAddr, target: &socks5::Target) -> Vec<
     run_check_kind(server_addr, target, config::TransportKind::Tls).await
 }
 
+/// Сериализует результат диагностики в однострочный JSON для полевого парсинга
+/// (`field-test.sh` через `jq`).
+///
+/// Схема: `{"target":..,"transport":..,"overall":"ok|failed","stages":[...]}`.
+/// `class` — `null` для `ok`/`skipped`; для `failed` — underscore-класс
+/// (`udp_filtered`, `tls_refused`, `server_unreachable`, `handshake`, `data_path`),
+/// совпадающий с reason-enum (ADR-023), чтобы CSV не требовал маппинга.
+pub fn stages_to_json(target: &str, kind: config::TransportKind, stages: &[StageResult]) -> String {
+    let overall = if stages
+        .iter()
+        .any(|s| matches!(s.status, StageStatus::Failed(_)))
+    {
+        "failed"
+    } else {
+        "ok"
+    };
+    let mut parts = Vec::with_capacity(stages.len());
+    for s in stages {
+        let (status, class) = match &s.status {
+            StageStatus::Ok => ("ok", "null".to_string()),
+            StageStatus::Skipped => ("skipped", "null".to_string()),
+            StageStatus::Failed(msg) => (
+                "failed",
+                format!("\"{}\"", json_escape(&class_from_failed_msg(msg))),
+            ),
+        };
+        parts.push(format!(
+            "{{\"name\":\"{}\",\"status\":\"{}\",\"class\":{}}}",
+            json_escape(s.name),
+            status,
+            class
+        ));
+    }
+    format!(
+        "{{\"target\":\"{}\",\"transport\":\"{}\",\"overall\":\"{}\",\"stages\":[{}]}}",
+        json_escape(target),
+        transport_str(kind),
+        overall,
+        parts.join(",")
+    )
+}
+
+fn transport_str(kind: config::TransportKind) -> &'static str {
+    match kind {
+        config::TransportKind::Tls => "tls",
+        config::TransportKind::Quic => "quic",
+    }
+}
+
+/// Канонический underscore-класс этапа из сообщения `failure_message` (kebab).
+fn class_from_failed_msg(msg: &str) -> String {
+    if msg.starts_with("udp-filtered") {
+        "udp_filtered".into()
+    } else if msg.starts_with("tls-refused") {
+        "tls_refused".into()
+    } else if msg.starts_with("server-unreachable") {
+        "server_unreachable".into()
+    } else if msg.starts_with("handshake:") {
+        "handshake".into()
+    } else if msg.starts_with("data-path:") {
+        "data_path".into()
+    } else {
+        msg.replace('-', "_")
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn skip(out: &mut Vec<StageResult>, names: &[&'static str]) {
     for name in names {
         out.push(StageResult {
@@ -336,6 +417,56 @@ mod tests {
         assert_eq!(
             io_class(&std::io::Error::from(HostUnreachable)),
             "host-unreachable"
+        );
+    }
+
+    #[test]
+    fn class_from_failed_msg_mapping() {
+        assert_eq!(class_from_failed_msg("udp-filtered"), "udp_filtered");
+        assert_eq!(class_from_failed_msg("tls-refused"), "tls_refused");
+        assert_eq!(
+            class_from_failed_msg("server-unreachable"),
+            "server_unreachable"
+        );
+        assert_eq!(class_from_failed_msg("handshake: boom"), "handshake");
+        assert_eq!(class_from_failed_msg("data-path: drop"), "data_path");
+        assert_eq!(
+            class_from_failed_msg("connection-refused"),
+            "connection_refused"
+        );
+    }
+
+    #[test]
+    fn stages_to_json_shape() {
+        let stages = vec![
+            StageResult {
+                name: "connect",
+                status: StageStatus::Ok,
+            },
+            StageResult {
+                name: "data",
+                status: StageStatus::Failed("udp-filtered".into()),
+            },
+            StageResult {
+                name: "socks5",
+                status: StageStatus::Skipped,
+            },
+        ];
+        let json = stages_to_json("example.com:443", config::TransportKind::Quic, &stages);
+        assert!(json.contains("\"target\":\"example.com:443\""), "{json}");
+        assert!(json.contains("\"transport\":\"quic\""), "{json}");
+        assert!(json.contains("\"overall\":\"failed\""), "{json}");
+        assert!(
+            json.contains("{\"name\":\"connect\",\"status\":\"ok\",\"class\":null}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("{\"name\":\"data\",\"status\":\"failed\",\"class\":\"udp_filtered\"}"),
+            "{json}"
+        );
+        assert!(
+            json.contains("{\"name\":\"socks5\",\"status\":\"skipped\",\"class\":null}"),
+            "{json}"
         );
     }
 }
