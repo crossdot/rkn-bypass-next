@@ -65,7 +65,7 @@
 | CI: load-smoke | ✅ | job `load-smoke` |
 | CI: systemd-hardening (score < 5.0) | ✅ | job `systemd-hardening` |
 | CI: release на тег v* | ✅ | `release.yml` |
-| Реальные замеры throughput на целевых сетях | 🟡 | localhost-only (P11); `scripts/field-test.sh` (P5.2) — ручной прогон на реальных сетях РФ |
+| Реальные замеры throughput на целевых сетях | 🟡 | стенд готов (v0.9.2-field-testing): `scripts/field-test.sh` (P5.2); прогон — вручную владельцем на реальных сим-картах, результаты в `docs/operations/field-testing-results/`; **до прогона v1.0.0 не ставить** |
 
 ## Известные ограничения / кандидаты
 

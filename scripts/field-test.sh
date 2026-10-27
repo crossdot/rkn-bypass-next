@@ -79,22 +79,37 @@ fail() { echo "[field-test] $*" >&2; exit 2; }
 # ---------- валидация ----------
 [ -n "$OPERATOR" ] || fail "--operator is required"
 [ -n "$REGION" ] || fail "--region is required"
-[ -n "$ACCESS" ] || fail "--access is required (4g|5g|wifi|ethernet)"
-[ -n "$DEVICE" ] || fail "--device is required (android|ios|laptop|desktop)"
 [ -n "$HOST" ] || fail "--host <server:port> is required"
 [ -n "$CLIENT_CERT" ] || fail "--client-cert is required"
 [ -n "$CLIENT_KEY" ] || fail "--client-key is required"
 [ -n "$CA" ] || fail "--ca is required"
 [ -n "$OUT" ] || fail "--out <dir> is required"
 
-case "$ACCESS" in 4g|5g|wifi|ethernet) ;; *) fail "bad --access '$ACCESS'" ;; esac
-case "$DEVICE" in android|ios|laptop|desktop) ;; *) fail "bad --device '$DEVICE'" ;; esac
+# `access`/`device` обязательны только для реального прогона: в --dry-run
+# печатаем план с дефолтами, не требуя метаданные.
+if [ "$DRY_RUN" -eq 0 ]; then
+  [ -n "$ACCESS" ] || fail "--access is required (4g|5g|wifi|ethernet)"
+  [ -n "$DEVICE" ] || fail "--device is required (android|ios|laptop|desktop)"
+  case "$ACCESS" in 4g|5g|wifi|ethernet) ;; *) fail "bad --access '$ACCESS'" ;; esac
+  case "$DEVICE" in android|ios|laptop|desktop) ;; *) fail "bad --device '$DEVICE'" ;; esac
+else
+  [ -n "$ACCESS" ] || ACCESS="4g"
+  [ -n "$DEVICE" ] || DEVICE="android"
+fi
 
 [ -x "$BIN/client" ] || fail "release client not found under $BIN (cargo build --release --workspace)"
 [ -x "$DIAG_BIN" ] || fail "release diag-cli not found under $BIN (cargo build --release --workspace)"
-for f in "$CLIENT_CERT" "$CLIENT_KEY" "$CA"; do
-  [ -f "$f" ] || fail "$f not found"
-done
+# --dry-run не читает сертификаты → достаточно существования пути (-e);
+# реальный прогон требует обычный файл (-f).
+if [ "$DRY_RUN" -ne 0 ]; then
+  for f in "$CLIENT_CERT" "$CLIENT_KEY" "$CA"; do
+    [ -e "$f" ] || fail "$f not found"
+  done
+else
+  for f in "$CLIENT_CERT" "$CLIENT_KEY" "$CA"; do
+    [ -f "$f" ] || fail "$f not found"
+  done
+fi
 
 # ---------- --dry-run: печатаем план, ничего не запускаем ----------
 if [ "$DRY_RUN" -ne 0 ]; then
