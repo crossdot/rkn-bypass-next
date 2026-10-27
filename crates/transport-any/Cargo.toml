@@ -9,6 +9,7 @@ transport-api = { path = "../transport-api" }
 transport-tls = { path = "../transport-tls" }
 transport-quic = { path = "../transport-quic" }
 async-trait = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 testkit = { path = "../testkit" }

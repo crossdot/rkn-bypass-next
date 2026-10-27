@@ -1,13 +1,17 @@
-//! Абстракция транспорта: трейт [`Transport`] и типы ошибок.
+//! Абстракция транспорта: трейт [`Transport`], [`BidirectionalRelay`] и типы
+//! ошибок.
 //!
-//! Контракт асинхронный (tokio), но без прямой зависимости на tokio или
-//! TLS-библиотеки: только [`async_trait`] для object-safety и `Send`.
+//! [`Transport`] не зависит от tokio напрямую (только [`async_trait`] для
+//! object-safety и `Send`). [`BidirectionalRelay`] — отдельная от [`Transport`]
+//! капабилити двунаправленного relay; её сигнатура принимает
+//! [`tokio::net::TcpStream`] (прикладная сторона), поэтому для неё нужен tokio.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 use async_trait::async_trait;
 use std::fmt;
+use tokio::net::TcpStream;
 
 /// Трейт сетевого транспорта (асинхронный).
 ///
@@ -79,3 +83,28 @@ impl From<std::io::Error> for TransportError {
 
 /// Псевдоним результата транспортной операции.
 pub type TransportResult<T, E = TransportError> = std::result::Result<T, E>;
+
+/// Двунаправленная передача байтов между транспортом и TCP-сокетом.
+///
+/// Отдельный от [`Transport`] трейт (ADR-025 — контракт [`Transport`] не
+/// изменяется). [`Transport::send`]/[`Transport::recv`] принимают `&mut self` и
+/// не могут исполняться конкурентно на одном объекте; наивный опрос обеих
+/// сторон (`timeout`-поллинг) приводит к дедлоку под backpressure, когда обе
+/// стороны заполнены: каждый `send` ждёт, пока противоположная сторона не
+/// освободит окно, а та — своего `send`. Поэтому корректный relay требует
+/// знания конкретного транспорта:
+///  - TLS (`TlsStream` — `AsyncRead + AsyncWrite`): `tokio::io::copy_bidirectional`;
+///  - QUIC (`SendStream`/`RecvStream` — раздельные `&mut`-потоки):
+///    два конкурентных `task`-а с одной стороной на каждый.
+///
+/// Реализации находятся в `transport-tls`, `transport-quic` и `transport-any`.
+#[async_trait]
+pub trait BidirectionalRelay {
+    /// Передаёт байты в обе стороны до завершения потока.
+    ///
+    /// `tcp` — «прикладная» сторона: app-сокет клиента или TCP-соединение к
+    /// цели на сервере. Транспорт должен быть уже подключён. Завершение одной
+    /// стороны закрывает другую (graceful drain); ошибка любой стороны
+    /// прерывает передачу.
+    async fn relay_bidirectional(self, tcp: TcpStream) -> Result<(), TransportError>;
+}

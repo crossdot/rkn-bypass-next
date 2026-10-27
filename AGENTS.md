@@ -22,7 +22,12 @@ Rust/Linux-система устойчивого обхода блокирово
   (например, `time = "=0.3.36"`) документировать в ADR-018.
 - Inline-секреты (PEM, ключи) не должны попадать в `Display`/`Debug` ошибок
   конфигурации. Проверять при изменениях `crates/config`.
-- `Transport` в MVP — синхронный. Не вводить `tokio` или async-контракт в `transport-api` без ADR-017. Async — Phase 2.
+- `Transport` — асинхронный (ADR-017). Контракт минимальный; `transport-api`
+  зависит от tokio только для сигнатуры `BidirectionalRelay`.
+- Двунаправленный relay — строго через `BidirectionalRelay` (ADR-025):
+  TLS — `copy_bidirectional`, QUIC — два конкурентных потока. Не возвращаться
+  к поллингу обеих сторон через таймаут (дедлок под backpressure) и не менять
+  контракт `Transport`.
 - MSRV = 1.85 (ADR-018). Не понижать без нового ADR. Не использовать
   edition2024 в собственном коде без отдельного решения.
 - Сертификаты: CA + leaf, не self-signed. Dev-ключи — только для

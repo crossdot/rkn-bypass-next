@@ -8,7 +8,8 @@
 #![warn(missing_docs)]
 
 use async_trait::async_trait;
-use transport_api::{Transport, TransportError};
+use tokio::net::TcpStream;
+use transport_api::{BidirectionalRelay, Transport, TransportError};
 use transport_quic::{QuicClientTransport, QuicServerTransport};
 use transport_tls::{ClientTransport, ServerTransport};
 
@@ -69,3 +70,23 @@ impl AnyServerTransport {
 
 dispatch_transport!(AnyClientTransport, Tls, Quic);
 dispatch_transport!(AnyServerTransport, Tls, Quic);
+
+#[async_trait]
+impl BidirectionalRelay for AnyClientTransport {
+    async fn relay_bidirectional(self, tcp: TcpStream) -> Result<(), TransportError> {
+        match self {
+            Self::Tls(t) => t.relay_bidirectional(tcp).await,
+            Self::Quic(t) => t.relay_bidirectional(tcp).await,
+        }
+    }
+}
+
+#[async_trait]
+impl BidirectionalRelay for AnyServerTransport {
+    async fn relay_bidirectional(self, tcp: TcpStream) -> Result<(), TransportError> {
+        match self {
+            Self::Tls(t) => t.relay_bidirectional(tcp).await,
+            Self::Quic(t) => t.relay_bidirectional(tcp).await,
+        }
+    }
+}

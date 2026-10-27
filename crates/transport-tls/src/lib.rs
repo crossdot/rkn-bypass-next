@@ -17,6 +17,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
+use transport_api::BidirectionalRelay;
 pub use transport_api::{Transport, TransportError};
 
 /// Идемпотентно устанавливает `ring` как crypto-provider rustls по умолчанию.
@@ -116,6 +117,18 @@ impl Transport for ClientTransport {
     }
 }
 
+#[async_trait]
+impl BidirectionalRelay for ClientTransport {
+    async fn relay_bidirectional(mut self, tcp: TcpStream) -> Result<(), TransportError> {
+        let mut tcp = tcp;
+        let mut stream = self.stream.take().ok_or(TransportError::NotConnected)?;
+        // TlsStream — AsyncRead + AsyncWrite: корректный полно-дуплексный relay.
+        tokio::io::copy_bidirectional(&mut stream, &mut tcp).await?;
+        let _ = stream.shutdown().await;
+        Ok(())
+    }
+}
+
 /// Серверный TLS-транспорт.
 ///
 /// TLS-сессия устанавливается в [`ServerTransport::accept`]; после этого
@@ -175,6 +188,19 @@ impl Transport for ServerTransport {
 
     async fn close(&mut self) -> Result<(), TransportError> {
         let _ = self.stream.shutdown().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BidirectionalRelay for ServerTransport {
+    async fn relay_bidirectional(self, tcp: TcpStream) -> Result<(), TransportError> {
+        let mut tcp = tcp;
+        let Self { stream } = self;
+        let mut stream = stream;
+        // TlsStream — AsyncRead + AsyncWrite: корректный полно-дуплексный relay.
+        tokio::io::copy_bidirectional(&mut stream, &mut tcp).await?;
+        let _ = stream.shutdown().await;
         Ok(())
     }
 }

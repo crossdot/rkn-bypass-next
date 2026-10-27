@@ -16,8 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 
-use transport_api::{Transport, TransportError};
+use transport_api::{BidirectionalRelay, Transport, TransportError};
 
 pub use quinn;
 
@@ -234,5 +236,116 @@ impl Transport for QuicServerTransport {
     async fn close(&mut self) -> Result<(), TransportError> {
         self.conn.close(0u32.into(), b"");
         Ok(())
+    }
+}
+
+/// Передаёт байты из TCP-сокета в QUIC `SendStream` до EOF прикладной стороны.
+async fn pump_tcp_to_quic(
+    mut tcp_read: ReadHalf<TcpStream>,
+    mut send: quinn::SendStream,
+) -> Result<(), TransportError> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match tcp_read.read(&mut buf).await {
+            Ok(0) => {
+                // Прикладная сторона закрыла write: сигналим завершение потока.
+                send.finish()
+                    .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+                return Ok(());
+            }
+            Ok(n) => send
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| TransportError::SendFailed(e.to_string()))?,
+            Err(_) => {
+                let _ = send.finish();
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Передаёт байты из QUIC `RecvStream` в TCP-сокет до EOF потока.
+async fn pump_quic_to_tcp(
+    mut tcp_write: WriteHalf<TcpStream>,
+    mut recv: quinn::RecvStream,
+) -> Result<(), TransportError> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match recv.read(&mut buf).await {
+            Ok(Some(n)) => tcp_write
+                .write_all(&buf[..n])
+                .await
+                .map_err(TransportError::from)?,
+            Ok(None) => {
+                let _ = tcp_write.shutdown().await;
+                return Ok(());
+            }
+            Err(_) => {
+                let _ = tcp_write.shutdown().await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Конкурентный двунаправленный relay QUIC-би-стрима с TCP-сокетом.
+///
+/// `SendStream`/`RecvStream` — раздельные `&mut`-потоки, поэтому они не могут
+/// исполняться конкурентно через единый [`Transport`] (см. [`BidirectionalRelay`]).
+/// Половинки TCP-сокета разнесены по двум фьючам; ошибка любой стороны
+/// отменяет другую (незавершённая фьюча дропается при выходе из функции).
+async fn relay_quic_bidirectional(
+    tcp: TcpStream,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) -> Result<(), TransportError> {
+    let (tcp_read, tcp_write) = tokio::io::split(tcp);
+    let send_fut = pump_tcp_to_quic(tcp_read, send);
+    let recv_fut = pump_quic_to_tcp(tcp_write, recv);
+    tokio::pin!(send_fut);
+    tokio::pin!(recv_fut);
+    let mut send_done = false;
+    let mut recv_done = false;
+
+    loop {
+        tokio::select! {
+            r = &mut send_fut, if !send_done => {
+                send_done = true;
+                r?;
+            }
+            r = &mut recv_fut, if !recv_done => {
+                recv_done = true;
+                r?;
+            }
+        }
+        if send_done && recv_done {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl BidirectionalRelay for QuicClientTransport {
+    async fn relay_bidirectional(mut self, tcp: TcpStream) -> Result<(), TransportError> {
+        self.ensure_stream().await?;
+        let send = self.send.take().ok_or(TransportError::NotConnected)?;
+        let recv = self.recv.take().ok_or(TransportError::NotConnected)?;
+        // `self` (endpoint + conn) живёт до конца вызова → UDP-сокет/driver
+        // не закрываются, пока идёт relay.
+        relay_quic_bidirectional(tcp, send, recv).await
+    }
+}
+
+#[async_trait]
+impl BidirectionalRelay for QuicServerTransport {
+    async fn relay_bidirectional(mut self, tcp: TcpStream) -> Result<(), TransportError> {
+        self.ensure_stream().await?;
+        let send = self.send.take().ok_or(TransportError::NotConnected)?;
+        let recv = self.recv.take().ok_or(TransportError::NotConnected)?;
+        // `self` (_endpoint + conn) живёт до конца вызова → UDP-сокет/driver
+        // не закрываются, пока идёт relay.
+        relay_quic_bidirectional(tcp, send, recv).await
     }
 }

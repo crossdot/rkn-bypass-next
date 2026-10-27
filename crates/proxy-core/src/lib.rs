@@ -12,13 +12,10 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
-use transport_api::{Transport, TransportError};
-
-/// Интервал опроса relay-цикла (таймаут чтения на обеих сторонах).
-pub const RELAY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+use transport_api::{BidirectionalRelay, Transport, TransportError};
 
 /// Таймаут ожидания `ConnectAck` на клиенте.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -240,7 +237,7 @@ async fn connect_ip(ip: IpAddr, port: u16, timeout: Duration) -> Result<TcpStrea
 /// Обрабатывает одно соединение на стороне клиента (SOCKS5 → транспорт).
 ///
 /// После успешного CONNECT релеит байты между app-сокетом и транспортом.
-pub async fn serve_client_connection<T: Transport>(
+pub async fn serve_client_connection<T: Transport + BidirectionalRelay>(
     mut app: TcpStream,
     mut client: T,
     ack_timeout: Duration,
@@ -310,7 +307,7 @@ pub async fn serve_client_connection<T: Transport>(
 }
 
 /// Обрабатывает одно соединение на стороне сервера (транспорт → TCP-цель).
-pub async fn serve_server_connection<T: Transport>(
+pub async fn serve_server_connection<T: Transport + BidirectionalRelay>(
     mut server: T,
     connect_timeout: Duration,
     rules: &config::AddressRules,
@@ -375,34 +372,17 @@ pub async fn serve_server_connection<T: Transport>(
 
 /// Двунаправленная передача байтов между TCP-сокетом и транспортом.
 ///
-/// Полинг обеих сторон через `tokio::time::timeout` ([`RELAY_POLL_INTERVAL`]).
-/// Завершение одной из сторон закрывает другую.
-pub async fn relay<T: Transport>(mut tcp: TcpStream, mut transport: T) -> Result<(), ProxyError> {
-    let mut buf = [0u8; 64 * 1024];
-
-    loop {
-        // tcp -> transport
-        match tokio::time::timeout(RELAY_POLL_INTERVAL, tcp.read(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()),
-            Ok(Ok(n)) => {
-                transport.send(&buf[..n]).await?;
-            }
-            Ok(Err(_)) => return Ok(()),
-            Err(_) => {}
-        }
-
-        // transport -> tcp
-        match tokio::time::timeout(RELAY_POLL_INTERVAL, transport.recv(&mut buf)).await {
-            Ok(Ok(0)) => {
-                let _ = tcp.shutdown().await;
-                return Ok(());
-            }
-            Ok(Ok(n)) => tcp.write_all(&buf[..n]).await?,
-            Ok(Err(_)) => {
-                let _ = tcp.shutdown().await;
-                return Ok(());
-            }
-            Err(_) => {}
-        }
-    }
+/// Делегируется капабилити [`BidirectionalRelay`] конкретного транспорта
+/// (ADR-025): TLS — `tokio::io::copy_bidirectional` (полный дуплекс), QUIC —
+/// два конкурентных потока. Наивный поллинг обеих сторон через таймаут
+/// приводил к дедлоку под backpressure, поэтому он удалён. Завершение одной
+/// стороны закрывает другую (graceful drain).
+pub async fn relay<T: Transport + BidirectionalRelay>(
+    tcp: TcpStream,
+    transport: T,
+) -> Result<(), ProxyError> {
+    transport
+        .relay_bidirectional(tcp)
+        .await
+        .map_err(ProxyError::from)
 }
