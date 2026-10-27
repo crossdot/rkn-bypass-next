@@ -162,6 +162,12 @@ p50≈p99. В реальной сети (RTT, потери) холодная п�
 **Метрики acquire-wait нет.** Есть только `event=transport_selected`
 (`probe_ms`, `cached_age_s`, `fail_count`) — тайминга ожидания лока нет.
 
+`alive_tasks` в `run_both` — ~1.9/сессия (relay: 2 task'а на QUIC + 1 на TLS).
+Rejected соединения (250 при `max_sessions=750`) тоже создают task, который
+затем умирает — это **не утечка** (после drain fd/tasks возвращаются к
+baseline), но даёт CPU-нагрузку на spawn/destroy под reject-нагрузкой.
+Зафиксировать для ADR-026, не фиксить.
+
 **Кандидат на ADR-026** (в P11 не фиксим): singleflight (один пробит, остальные
 ждут результат) или отпускать лок перед `probe().await` и перезабирать после.
 UI/API не меняются.
