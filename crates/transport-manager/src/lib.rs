@@ -34,6 +34,19 @@ pub const PROBE_BYTE: u8 = 0x01;
 /// Ниже — DEBUG: ожидания нет, это обычный выбор.
 const ACQUIRE_WAIT_INFO_MS: u64 = 100;
 
+/// Только тесты (cfg(test)): расширяет окно между `drop(state)` и
+/// `notified().await` в wait-ветке `select_inner`, чтобы детерминированно
+/// воспроизвести lost-wakeup. На раци-коде (notified создаётся после drop)
+/// вейтер, попавший в окно, теряет `notify_waiters()` и зависает; на
+/// исправленном (pre-register до lock) — получает wakeup. См. ADR-027,
+/// tokio notify.rs:529-531, 562-571.
+#[cfg(test)]
+static FORCE_WINDOW_YIELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+const WINDOW_YIELD_COUNT: usize = 128;
+
 /// Фабрика транспорта нужного типа (TLS/QUIC).
 pub type TransportFactory =
     Arc<dyn Fn(TransportKind) -> Result<AnyClientTransport, TransportError> + Send + Sync>;
@@ -270,6 +283,9 @@ pub struct TransportManager {
     policy: TransportPolicy,
     probe: Arc<dyn Probe>,
     clock: Arc<dyn Clock>,
+    /// Пробуждение ожидающих; та же Arc, что и `State.notify` (для pre-register
+    /// `notified()` до захвата лока в singleflight, ADR-027).
+    notify: Arc<Notify>,
     state: tokio::sync::Mutex<State>,
 }
 
@@ -285,11 +301,18 @@ impl TransportManager {
         probe: Arc<dyn Probe>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let notify = Arc::new(Notify::new());
         Self {
             policy,
             probe,
             clock,
-            state: tokio::sync::Mutex::new(State::default()),
+            notify: Arc::clone(&notify),
+            state: tokio::sync::Mutex::new(State {
+                tls: Entry::default(),
+                quic: Entry::default(),
+                probing: None,
+                notify,
+            }),
         }
     }
 
@@ -352,6 +375,12 @@ impl TransportManager {
         let mut idx = 0usize;
 
         'outer: loop {
+            // Pre-register до lock: `notified` создаётся раньше любого возможного
+            // `notify_waiters()` (пробирщик вызывает его только после повторного
+            // захвата лока, а он происходит позже нашего создания). Иначе —
+            // lost-wakeup: вейтер проверяет probing, отпускает лок, и пробирщик
+            // успевает notify_waiters() до регистрации future (ADR-027).
+            let notified = self.notify.notified();
             let mut state = self.state.lock().await;
             let now = self.clock.now();
 
@@ -411,11 +440,20 @@ impl TransportManager {
                 };
             };
 
-            // Singleflight: кто-то уже пробит — ждём результат.
+            // Singleflight: кто-то уже пробит — ждём результат. `notified` уже
+            // создан до lock (pre-register), поэтому потерять wakeup нельзя.
             if state.probing.is_some() {
-                let notify = state.notify.clone();
                 drop(state);
-                notify.notified().await;
+                // Только тест: детерминированно расширяем окно между
+                // drop(state) и notified().await, чтобы воспроизвести lost-wakeup
+                // на раци-коде (notified после drop) и доказать фикс.
+                #[cfg(test)]
+                if FORCE_WINDOW_YIELD.load(std::sync::atomic::Ordering::SeqCst) {
+                    for _ in 0..WINDOW_YIELD_COUNT {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                notified.await;
                 continue 'outer;
             }
 
@@ -1272,5 +1310,77 @@ mod tests {
         let sel = handle.await.unwrap();
         assert_eq!(sel.kind, TransportKind::Tls);
         assert_eq!(probe.calls().len(), 1);
+    }
+
+    /// Multi-thread regression на lost-wakeup в singleflight.
+    ///
+    /// Включает `FORCE_WINDOW_YIELD` (cfg(test)), который расширяет окно между
+    /// `drop(state)` и `notified().await` в wait-ветке `select_inner`. На
+    /// раци-коде (notified создаётся после drop, после yield) вейтер, попавший
+    /// в окно, теряет `notify_waiters()` и зависает; на исправленном
+    /// (pre-register до lock) — получает wakeup. Current-thread тест это окно
+    /// не ловит (нет вытеснения между drop и notified), поэтому именно
+    /// `multi_thread` с 2 воркерами.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_wakeup_multi_thread() {
+        FORCE_WINDOW_YIELD.store(true, Ordering::SeqCst);
+        // Если тест падает, статик остаётся true → параллельные тесты просто
+        // делают лишние yield (фикс их не ломает). Здесь жёстко сбрасываем.
+        let res = lost_wakeup_multi_thread_inner().await;
+        FORCE_WINDOW_YIELD.store(false, Ordering::SeqCst);
+        res
+    }
+
+    async fn lost_wakeup_multi_thread_inner() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Arc::new(Notify::new());
+        let probe = Arc::new(MockProbe::with_gate(gate.clone()));
+        probe.set(TransportKind::Tls, None);
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let barrier = Arc::new(Barrier::new(100 + 1));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            set.spawn(async move {
+                barrier.wait().await;
+                mgr.select().await
+            });
+        }
+        barrier.wait().await;
+
+        // Пробирщик в полёте (блокирован на gate); вейтеры вошли в wait-ветку.
+        while probe.max_in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Даём вейтерам войти в yield-окно (до notified().await).
+        tokio::task::yield_now().await;
+
+        // Отпускаем пробирщика: он завершит пробу и вызовет notify_waiters().
+        gate.notify_waiters();
+
+        // Все 100 select() должны завершиться за ограниченное время. На
+        // раци-коде хотя бы один вейтер теряет wakeup → join_next не
+        // завершается в срок → panic по таймауту.
+        let n = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut n = 0;
+            while let Some(res) = set.join_next().await {
+                let sel = res.expect("select завершился");
+                assert_eq!(sel.kind, TransportKind::Tls);
+                n += 1;
+            }
+            n
+        })
+        .await
+        .expect("все 100 select завершились без lost-wakeup (зависание)");
+
+        assert_eq!(n, 100);
+        assert_eq!(probe.calls().len(), 1, "singleflight: 1 проба на N");
     }
 }

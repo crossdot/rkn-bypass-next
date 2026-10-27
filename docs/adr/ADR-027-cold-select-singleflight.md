@@ -40,8 +40,53 @@ struct State {
   `probing`, `notify_waiters()`.
 - Остальные acquire: берут лок, видят `probing.is_some()` → отпускают лок,
   `notify.notified().await` → re-check после пробуждения. Повторных проб нет.
-- `notify_waiters()` латчит бит в tokio `Notify` — проснувшийся позже waiter
-  не пропускает уведомление (без `watch`).
+- `notify_waiters()` **не** хранит permit для будущих вейтеров (в отличие от
+  `notify_one()`, который кладёт permit). Поэтому waiter обязан
+  зарегистрироваться (`notified()`) ДО того, как пробирщик вызовет
+  `notify_waiters()`. Первая реализация это нарушала — см. «Lost-wakeup и фикс».
+
+### Lost-wakeup и фикс (review)
+
+Реализация создавала `notify.notified()` **после** проверки `probing` и
+`drop(state)` — гонка:
+```rust
+if state.probing.is_some() {
+    let notify = state.notify.clone();
+    drop(state);
+    notify.notified().await;   // RACY: notified() создаётся после drop
+}
+```
+Окно: между `drop(state)` и `notified()` пробирщик на другом потоке успевает
+пере-захватить lock и вызвать `notify_waiters()`. `Notify` не хранит permit для
+`notify_waiters()`: `tokio/src/sync/notify.rs:529-531` — гарантия wakeup только
+если `Notified` создан до `notify_waiters()`; `:562-571` — `notified()` снимает
+счётчик `notify_waiters_calls` в момент создания. Вейтер теряет wakeup →
+блокируется до следующей пробы. Current-thread тесты (`#[tokio::test]`) этого не
+ловили — нет вытеснения между `drop(state)` и `notified()`.
+
+Фикс — pre-register: `notified` создаётся **до** `lock().await`:
+```rust
+let notified = self.notify.notified();   // до любого notify_waiters()
+let mut state = self.state.lock().await;
+// ...
+if state.probing.is_some() {
+    drop(state);
+    notified.await;   // уже зарегистрирован → wakeup не потерян
+    continue 'outer;
+}
+```
+`notified` создаётся в начале каждой итерации `'outer` (при каждом
+`continue 'outer` — новый, старый израсходован). `TransportManager` хранит
+`notify: Arc<Notify>` (та же Arc, что и `State.notify`) для пре-регистрации до
+захвата лока. Пробирщик вызывает `notify_waiters()` только после повторного
+захвата лока, который происходит позже нашего `notified()`.
+
+Доказательство: `lost_wakeup_multi_thread`
+(`#[tokio::test(flavor = "multi_thread", worker_threads = 2)`), включает
+`FORCE_WINDOW_YIELD` (cfg(test)) — расширяет окно между `drop(state)` и
+`notified().await` yield-ами. На раци-коде тест падает по таймауту
+(`Elapsed(())` — вейтеры потеряли `notify_waiters()`), на исправленном —
+проходит (`1 проба на 100`).
 
 ### Семантика `invalidate`
 
@@ -78,6 +123,10 @@ invalidate). Waiters к этому моменту уже ушли в fallback. �
 - 1 проба на транспорт за холодный цикл (не N); lock не держится через probe.
 - Waiters просыпаются через `notify_waiters()` и перечитывают `Entry` (cache /
   backoff) — повторных проб нет.
+- **Lost-wakeup исправлен pre-register** (см. «Lost-wakeup и фикс»): `notified`
+  создаётся до `lock`. Без этого на multi-thread рантайме вейтер мог потерять
+  `notify_waiters()` и зависнуть; current-thread тесты не ловили, добавлен
+  multi-thread тест `lost_wakeup_multi_thread`.
 - Метрика `transport_acquire_wait_ms` позволяет измерить эффект на реальной
   сети.
 - Гистерезис переключения (`min_switch_interval=30с`) **не реализован**: он был
