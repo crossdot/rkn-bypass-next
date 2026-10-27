@@ -12,9 +12,23 @@
 | Нативные systemd-unit'ы + hardening | ✅ | `deploy/systemd/` (ADR-026), score 1.9/1.8 |
 | nftables-правила | ✅ | `deploy/nftables/rkn-server.nft` (ручное применение) |
 | Инструкция нативной установки | ✅ | `docs/operations/native-install.md` |
-| Автоматизированная установка (пакеты) | 🟡 | `scripts/install.sh` есть; deb/rpm — Phase 2 |
+| `--check-config` (валидация env/cert/key/rules/clients) | ✅ | `rkn-server`/`rkn-client`; `install.sh` использует |
+| Автоматизированная установка (пакеты) | 🟡 | `scripts/install.sh` + `--check-config`; deb/rpm — Phase 2 |
 | RHEL/Fedora | ⬜ | Phase 2 (systemd/пакеты) |
-| Установка/удаление на поддерживаемых дистрибутивах | 🟡 | Debian 12 + Ubuntu 22.04/24.04; удаление — вручную (`systemctl disable --now`, удалить unit/бинарник) |
+| Установка/удаление на поддерживаемых дистрибутивах | 🟡 | Debian 12 + Ubuntu 22.04/24.04; удаление вручную (`systemctl disable --now`) |
+
+## Релиз и эксплуатация (P10)
+
+| Пункт | Статус | Артефакт/примечание |
+|---|---|---|
+| Артефакты релиза + checksums + SBOM | ✅ | `scripts/release.sh` (dist/, tarballs, SHA256SUMS) |
+| Подпись бинарников (cosign keyless) | ✅ | `.github/workflows/release.yml` (sign-blob + verify) |
+| Release process | ✅ | `docs/operations/release-process.md` |
+| Staging + smoke | ✅ | `docs/operations/staging.md` (ручной) |
+| Rollback | ✅ | `docs/operations/rollback.md` (`--force-env`, оба бинарника) |
+| Backup/restore | ✅ | `docs/operations/backup-restore.md` (предупреждение о CA key) |
+| Beta-процесс | ✅ | `docs/operations/beta.md` (без `--beta` флага) |
+| Теги релизов | ✅ | новые — annotated (`vX.Y-name`); исторические lightweight |
 
 ## Безопасность и аутентификация
 
@@ -49,7 +63,8 @@
 | CI: e2e (tls/quic/auto/fallback) | ✅ | job `e2e` |
 | CI: load-smoke | ✅ | job `load-smoke` |
 | CI: systemd-hardening (score < 5.0) | ✅ | job `systemd-hardening` |
-| Реальные замеры throughput на целевых сетях | ⬜ | localhost-only (P11); нужны полевые замеры |
+| CI: release на тег v* | ✅ | `release.yml` |
+| Реальные замеры throughput на целевых сетях | 🟡 | localhost-only (P11); нужны полевые замеры (P5.2) |
 
 ## Известные ограничения / кандидаты
 
@@ -64,6 +79,7 @@
 
 - ✅ Docker-путь (ADR-011) и ✅ нативный systemd-путь (ADR-026) работают.
 - ✅ mTLS, отзыв, лимиты сессий, аудит.
-- ✅ CI-гейты (check/e2e/load-smoke/systemd-hardening/docker).
+- ✅ Релиз: артефакты+checksums+SBOM, подпись (cosign), staging/rollback/backup/beta.
+- ✅ CI-гейты (check/e2e/load-smoke/systemd-hardening/docker/release).
 - 🟡 «Автоматизированная установка» — частично (install.sh + ручной nft);
   пакеты — Phase 2.

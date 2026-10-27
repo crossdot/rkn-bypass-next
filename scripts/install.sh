@@ -3,14 +3,14 @@
 #
 # Usage:
 #   sudo scripts/install.sh --server [--bin PATH] [--prefix DIR] [--etc DIR]
-#                            [--apply-nft --yes]
-#   sudo scripts/install.sh --client [--bin PATH] [--prefix DIR] [--etc DIR]
+#                            [--force-env] [--apply-nft --yes]
+#   sudo scripts/install.sh --client [--bin PATH] [--prefix DIR] [--etc DIR] [--force-env]
 #
 # Что делает:
 #   1. проверяет root и systemd >= 249;
 #   2. создаёт системного пользователя rkn;
-#   3. копирует бинарник, unit и env-пример (env — только если ещё нет);
-#   4. pre-check сертификатов (fail-fast) по путям из env;
+#   3. копирует бинарник, unit и env-пример (env — если нет или --force-env);
+#   4. проверяет конфигурацию через `<bin> --check-config <env>` (fail-fast);
 #   5. для сервера копирует nftables-правила в /etc/nftables.d/ и НЕ применяет
 #      (печатает `nft -f`; авто-применение — только --apply-nft --yes);
 #   6. systemctl daemon-reload && enable --now;
@@ -27,8 +27,9 @@ NFT_DIR="/etc/nftables.d"
 BIN=""
 APPLY_NFT=0
 ASSUME_YES=0
+FORCE_ENV=0
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "[install] $*"; }
 
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
     --etc) ETC_DIR="$2"; shift 2 ;;
     --apply-nft) APPLY_NFT=1; shift ;;
     --yes) ASSUME_YES=1; shift ;;
+    --force-env) FORCE_ENV=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown arg: $1" ;;
   esac
@@ -88,33 +90,18 @@ say "installed binary: $PREFIX/$BIN_NAME"
 install -D -m 0644 "$ROOT/deploy/systemd/$UNIT_NAME" "$UNIT_DIR/$UNIT_NAME"
 say "installed unit: $UNIT_DIR/$UNIT_NAME"
 
-# --- env (only if absent) ---
-if [ ! -e "$ENV_DST" ]; then
+# --- env (only if absent, unless --force-env) ---
+if [ ! -e "$ENV_DST" ] || [ "$FORCE_ENV" -eq 1 ]; then
   install -D -m 0640 -o root -g rkn "$ENV_SRC" "$ENV_DST"
-  say "installed env example: $ENV_DST (edit before production)"
+  say "installed env: $ENV_DST (edit before production)"
 else
-  say "kept existing env: $ENV_DST"
+  say "kept existing env: $ENV_DST (use --force-env to overwrite)"
 fi
 
-# --- pre-check certs (fail-fast) ---
-get_env() { [ -f "$ENV_DST" ] && sed -n "s/^$1=//p" "$ENV_DST" | tail -1 || true; }
-chk() { [ -f "$1" ] || die "missing required file: $1"; }
-
-if [ "$COMPONENT" = "server" ]; then
-  cert="$(get_env CERT_PATH)"; cert="${cert:-$ETC_DIR/server.crt}"
-  key="$(get_env KEY_PATH)"; key="${key:-$ETC_DIR/server.key}"
-  ca="$(get_env CA_PATH)"; ca="${ca:-$ETC_DIR/ca.crt}"
-  chk "$cert"; chk "$key"; chk "$ca"
-  rules="$(get_env RULES_PATH)"; [ -n "$rules" ] && [ ! -f "$rules" ] && say "WARN: RULES_PATH not found: $rules"
-  clients="$(get_env CLIENTS_PATH)"; [ -n "$clients" ] && [ ! -f "$clients" ] && say "WARN: CLIENTS_PATH not found: $clients (server fails closed)"
-  say "certificates OK: $cert $key $ca"
-else
-  ca="$(get_env CA_PATH)"; ca="${ca:-$ETC_DIR/ca.crt}"
-  ccert="$(get_env CLIENT_CERT)"; ccert="${ccert:-$ETC_DIR/client.crt}"
-  ckey="$(get_env CLIENT_KEY)"; ckey="${ckey:-$ETC_DIR/client.key}"
-  chk "$ca"; chk "$ccert"; chk "$ckey"
-  say "certificates OK: $ccert $ckey $ca"
-fi
+# --- pre-check config (fail-fast) via --check-config ---
+say "checking config: $ENV_DST"
+"$PREFIX/$BIN_NAME" --check-config "$ENV_DST" || die "configuration check failed (fix $ENV_DST / certificates)"
+say "config OK"
 
 # --- nftables (server only): copy, do not apply ---
 if [ "$COMPONENT" = "server" ]; then

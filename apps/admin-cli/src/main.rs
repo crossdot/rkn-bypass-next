@@ -48,11 +48,37 @@ fn save_file(path: &str, file: &ClientsFile) -> Result<(), String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1] != "client" {
-        eprintln!("usage: admin-cli client <add|revoke|rotate-key|list> [client_id]");
+        eprintln!(
+            "usage: admin-cli client <add|revoke|rotate-key|list> [client_id] [--max-sessions N]"
+        );
         std::process::exit(2);
     }
     let cmd = args.get(2).map(|s| s.as_str()).unwrap_or("");
-    let id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+
+    let mut id = String::new();
+    let mut max_sessions: Option<u32> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-sessions" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--max-sessions requires <N>");
+                    std::process::exit(2);
+                };
+                max_sessions = Some(v.parse::<u32>().unwrap_or_else(|_| {
+                    eprintln!("--max-sessions must be a non-negative integer");
+                    std::process::exit(2);
+                }));
+                i += 2;
+            }
+            other => {
+                if id.is_empty() {
+                    id = other.to_string();
+                }
+                i += 1;
+            }
+        }
+    }
 
     let clients_path = env_or("CLIENTS_PATH", "configs/clients.toml");
     let clients_dir = env_or("CLIENTS_DIR", "configs/clients");
@@ -66,9 +92,16 @@ fn main() {
     );
 
     match cmd {
-        "add" => cmd_add(id, &clients_path, &clients_dir, &ca_cert, &ca_key),
-        "revoke" => cmd_revoke(id, &clients_path),
-        "rotate-key" => cmd_rotate(id, &clients_path, &clients_dir, &ca_cert, &ca_key),
+        "add" => cmd_add(
+            &id,
+            &clients_path,
+            &clients_dir,
+            &ca_cert,
+            &ca_key,
+            max_sessions,
+        ),
+        "revoke" => cmd_revoke(&id, &clients_path),
+        "rotate-key" => cmd_rotate(&id, &clients_path, &clients_dir, &ca_cert, &ca_key),
         "list" => cmd_list(&clients_path),
         _ => {
             eprintln!("unknown command: {cmd}");
@@ -77,7 +110,14 @@ fn main() {
     }
 }
 
-fn cmd_add(id: &str, path: &str, dir: &str, ca_cert: &str, ca_key: &str) {
+fn cmd_add(
+    id: &str,
+    path: &str,
+    dir: &str,
+    ca_cert: &str,
+    ca_key: &str,
+    max_sessions: Option<u32>,
+) {
     if id.is_empty() {
         eprintln!("client_id required");
         std::process::exit(2);
@@ -102,7 +142,7 @@ fn cmd_add(id: &str, path: &str, dir: &str, ca_cert: &str, ca_key: &str) {
         // inline PEM: конфиг сервера самодостаточен (не зависит от путей).
         key_material: generated.cert_pem.clone(),
         revoked: false,
-        max_sessions: None,
+        max_sessions,
     });
     save_file(path, &file).unwrap_or_else(|e| fail(&e));
 

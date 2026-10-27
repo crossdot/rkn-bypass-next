@@ -66,3 +66,46 @@ fn add_revoke_rotate_list() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn add_with_max_sessions() {
+    let dir = std::env::temp_dir().join(format!("admin-cli-max-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let clients_path = dir.join("clients.toml").display().to_string();
+    let clients_dir = dir.join("clients").display().to_string();
+    let ca_cert = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.crt");
+    let ca_key = concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs/dev-ca.key");
+    let env = [
+        ("CLIENTS_PATH", clients_path.clone()),
+        ("CLIENTS_DIR", clients_dir.clone()),
+        ("CA_CERT", ca_cert.to_string()),
+        ("CA_KEY", ca_key.to_string()),
+    ];
+
+    // с флагом → max_sessions = 5
+    let (stdout, _) = run(&["client", "add", "bob", "--max-sessions", "5"], &env);
+    let fp = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("# fingerprint: "))
+        .unwrap()
+        .trim()
+        .to_string();
+    let toml = fs::read_to_string(&clients_path).unwrap();
+    assert!(toml.contains("max_sessions = 5"), "{toml}");
+    let reg = config::ClientRegistry::from_toml(&toml).unwrap();
+    assert_eq!(reg.find_by_fingerprint(&fp).unwrap().max_sessions, Some(5));
+
+    // без флага → None
+    let (stdout, _) = run(&["client", "add", "carol"], &env);
+    let fp = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("# fingerprint: "))
+        .unwrap()
+        .trim()
+        .to_string();
+    let toml = fs::read_to_string(&clients_path).unwrap();
+    let reg = config::ClientRegistry::from_toml(&toml).unwrap();
+    assert_eq!(reg.find_by_fingerprint(&fp).unwrap().max_sessions, None);
+
+    fs::remove_dir_all(&dir).ok();
+}

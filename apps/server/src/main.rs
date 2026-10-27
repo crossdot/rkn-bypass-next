@@ -75,6 +75,117 @@ fn load_client_registry() -> config::ClientRegistry {
     }
 }
 
+/// Читает env-файл (`KEY=VALUE`, `#`-комментарии) и применяет к процессу.
+fn load_env_file(path: &str) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read env file {path}: {e}"))?;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!(
+                "{path}:{}: expected KEY=VALUE, got `{line}`",
+                i + 1
+            ));
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            return Err(format!("{path}:{}: empty key", i + 1));
+        }
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+        std::env::set_var(k, v);
+    }
+    Ok(())
+}
+
+/// `--check-config <env-file>`: валидация конфигурации без запуска сервера.
+fn check_config(path: &str) -> Result<(), String> {
+    load_env_file(path)?;
+
+    let listen = env_or("LISTEN_ADDR", "127.0.0.1:8443");
+    listen
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("LISTEN_ADDR={listen}: {e}"))?;
+
+    if let Ok(v) = std::env::var("TRANSPORT") {
+        if !v.is_empty() {
+            v.parse::<config::TransportStrategy>()
+                .map_err(|e| format!("TRANSPORT={v}: {e}"))?;
+        }
+    }
+
+    let cert_path = env_or("CERT_PATH", "");
+    let key_path = env_or("KEY_PATH", "");
+    let ca_path = env_or("CA_PATH", "");
+    if cert_path.is_empty() {
+        return Err("CERT_PATH is not set".into());
+    }
+    if key_path.is_empty() {
+        return Err("KEY_PATH is not set".into());
+    }
+    if ca_path.is_empty() {
+        return Err("CA_PATH is not set".into());
+    }
+
+    let mut certs = load_certs(&cert_path).map_err(|e| format!("CERT_PATH={cert_path}: {e}"))?;
+    let key = load_key(&key_path).map_err(|e| format!("KEY_PATH={key_path}: {e}"))?;
+    let ca_certs = load_certs(&ca_path).map_err(|e| format!("CA_PATH={ca_path}: {e}"))?;
+    certs.extend(ca_certs.iter().cloned());
+
+    let mut roots = RootCertStore::empty();
+    for c in &ca_certs {
+        roots
+            .add(c.clone())
+            .map_err(|e| format!("CA_PATH={ca_path}: {e}"))?;
+    }
+    let inner = server::AuthClientVerifier::build_inner(Arc::new(roots))
+        .map_err(|e| format!("CA_PATH={ca_path}: {e}"))?;
+    ServerConfig::builder()
+        .with_client_cert_verifier(inner)
+        .with_single_cert(certs, key)
+        .map_err(|e| {
+            format!("CERT_PATH/KEY_PATH: certificate/private key invalid or mismatch: {e}")
+        })?;
+
+    if let Ok(p) = std::env::var("RULES_PATH") {
+        if !p.is_empty() {
+            let toml = std::fs::read_to_string(&p).map_err(|e| format!("RULES_PATH={p}: {e}"))?;
+            config::AddressRules::from_toml(&toml).map_err(|e| format!("RULES_PATH={p}: {e}"))?;
+        }
+    }
+    if let Ok(p) = std::env::var("CLIENTS_PATH") {
+        if !p.is_empty() {
+            let toml = std::fs::read_to_string(&p).map_err(|e| format!("CLIENTS_PATH={p}: {e}"))?;
+            config::ClientRegistry::from_toml(&toml)
+                .map_err(|e| format!("CLIENTS_PATH={p}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Если передан `--check-config <env-file>` — вернуть код выхода (иначе None).
+fn check_config_if_requested() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let pos = args.iter().position(|a| a == "--check-config")?;
+    let Some(path) = args.get(pos + 1) else {
+        eprintln!("error: --check-config requires <env-file>");
+        return Some(2);
+    };
+    ensure_crypto_provider();
+    match check_config(path) {
+        Ok(()) => {
+            println!("config OK: {path}");
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Some(1)
+        }
+    }
+}
+
 /// TLS: `TcpListener` + per-connection rustls config с `AuthClientVerifier`
 /// (адрес пира известен из `accept`).
 async fn run_tls(
@@ -211,6 +322,10 @@ fn spawn_task_metrics() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = check_config_if_requested() {
+        std::process::exit(code);
+    }
+
     ensure_crypto_provider();
     // Аудит-логи: компактный key=value на stderr; уровень по умолчанию info
     // (переопределяется RUST_LOG). См. ADR-021 «Аудит handshake'ей».
@@ -281,4 +396,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod check_config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn certs_dir() -> String {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs").to_string()
+    }
+
+    fn tmp_file(name: &str, body: &str) -> String {
+        let p = std::env::temp_dir().join(format!("rkn-check-{}-{name}", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn server_env(key_name: &str) -> String {
+        let d = certs_dir();
+        format!(
+            "LISTEN_ADDR=127.0.0.1:18443\nTRANSPORT=tls\n\
+             CERT_PATH={d}/dev-server.crt\nKEY_PATH={d}/{key_name}\nCA_PATH={d}/dev-ca.crt\n\
+             RULES_PATH=\nCLIENTS_PATH=\n"
+        )
+    }
+
+    #[test]
+    fn valid_config_ok() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file("valid.env", &server_env("dev-server.key"));
+        assert_eq!(check_config(&f), Ok(()));
+    }
+
+    #[test]
+    fn missing_cert_fails() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file(
+            "nocert.env",
+            "LISTEN_ADDR=127.0.0.1:18443\nCERT_PATH=/nonexistent.crt\n\
+             KEY_PATH=/nonexistent.key\nCA_PATH=/nonexistent.crt\n",
+        );
+        let e = check_config(&f).unwrap_err();
+        assert!(e.contains("CERT_PATH"), "{e}");
+    }
+
+    #[test]
+    fn key_cert_mismatch_fails() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file("mismatch.env", &server_env("dev-ca.key"));
+        let e = check_config(&f).unwrap_err();
+        assert!(e.to_lowercase().contains("mismatch"), "{e}");
+    }
+
+    #[test]
+    fn broken_rules_fails() {
+        let _g = LOCK.lock().unwrap();
+        let rules = tmp_file("rules.toml", "this is not toml = = =\n");
+        let d = certs_dir();
+        let f = tmp_file(
+            "brokenrules.env",
+            &format!(
+                "LISTEN_ADDR=127.0.0.1:18443\nTRANSPORT=tls\n\
+                 CERT_PATH={d}/dev-server.crt\nKEY_PATH={d}/dev-server.key\n\
+                 CA_PATH={d}/dev-ca.crt\nRULES_PATH={rules}\nCLIENTS_PATH=\n"
+            ),
+        );
+        let e = check_config(&f).unwrap_err();
+        assert!(e.contains("RULES_PATH"), "{e}");
+    }
 }

@@ -55,6 +55,92 @@ fn load_client_config(
         .with_client_auth_cert(certs, key)?)
 }
 
+/// Читает env-файл (`KEY=VALUE`, `#`-комментарии) и применяет к процессу.
+fn load_env_file(path: &str) -> Result<(), String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read env file {path}: {e}"))?;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!(
+                "{path}:{}: expected KEY=VALUE, got `{line}`",
+                i + 1
+            ));
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            return Err(format!("{path}:{}: empty key", i + 1));
+        }
+        let v = v.trim().trim_matches(|c| c == '"' || c == '\'');
+        std::env::set_var(k, v);
+    }
+    Ok(())
+}
+
+/// `--check-config <env-file>`: валидация конфигурации без запуска клиента.
+fn check_config(path: &str) -> Result<(), String> {
+    load_env_file(path)?;
+
+    let listen = env_or("LISTEN_ADDR", "127.0.0.1:1080");
+    listen
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("LISTEN_ADDR={listen}: {e}"))?;
+
+    let server = env_or("SERVER_ADDR", "");
+    if server.is_empty() {
+        return Err("SERVER_ADDR is not set".into());
+    }
+    server
+        .to_socket_addrs()
+        .map_err(|e| format!("SERVER_ADDR={server}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("SERVER_ADDR={server}: resolved to no address"))?;
+
+    config::TransportPolicy::from_env().map_err(|e| format!("transport policy: {e}"))?;
+
+    let ca = env_or("CA_PATH", "");
+    let ccert = env_or("CLIENT_CERT", "");
+    let ckey = env_or("CLIENT_KEY", "");
+    if ca.is_empty() {
+        return Err("CA_PATH is not set".into());
+    }
+    if ccert.is_empty() {
+        return Err("CLIENT_CERT is not set".into());
+    }
+    if ckey.is_empty() {
+        return Err("CLIENT_KEY is not set".into());
+    }
+
+    load_client_config(&ca, &ccert, &ckey).map_err(|e| {
+        format!("CA_PATH/CLIENT_CERT/CLIENT_KEY: certificate/private key invalid or mismatch: {e}")
+    })?;
+    Ok(())
+}
+
+/// Если передан `--check-config <env-file>` — вернуть код выхода (иначе None).
+fn check_config_if_requested() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let pos = args.iter().position(|a| a == "--check-config")?;
+    let Some(path) = args.get(pos + 1) else {
+        eprintln!("error: --check-config requires <env-file>");
+        return Some(2);
+    };
+    ensure_crypto_provider();
+    match check_config(path) {
+        Ok(()) => {
+            println!("config OK: {path}");
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Some(1)
+        }
+    }
+}
+
 /// Создаёт транспорт нужного типа через общий конструктор
 /// (`transport-manager::client_transport`) — без дублирования в приложениях.
 fn build_transport(
@@ -99,6 +185,10 @@ fn spawn_task_metrics() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = check_config_if_requested() {
+        std::process::exit(code);
+    }
+
     ensure_crypto_provider();
     tracing_subscriber::fmt()
         .compact()
@@ -181,5 +271,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod check_config_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn certs_dir() -> String {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../certs").to_string()
+    }
+
+    fn tmp_file(name: &str, body: &str) -> String {
+        let p = std::env::temp_dir().join(format!("rkn-check-cli-{}-{name}", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn client_env(key_name: &str) -> String {
+        let d = certs_dir();
+        format!(
+            "LISTEN_ADDR=127.0.0.1:11080\nSERVER_ADDR=127.0.0.1:18443\nTRANSPORT=tls\n\
+             CA_PATH={d}/dev-ca.crt\nCLIENT_CERT={d}/dev-server.crt\nCLIENT_KEY={d}/{key_name}\n"
+        )
+    }
+
+    #[test]
+    fn valid_config_ok() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file("valid.env", &client_env("dev-server.key"));
+        assert_eq!(check_config(&f), Ok(()));
+    }
+
+    #[test]
+    fn missing_cert_fails() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file(
+            "nocert.env",
+            "LISTEN_ADDR=127.0.0.1:11080\nSERVER_ADDR=127.0.0.1:18443\n\
+             CA_PATH=/nonexistent.crt\nCLIENT_CERT=/nonexistent.crt\nCLIENT_KEY=/nonexistent.key\n",
+        );
+        let e = check_config(&f).unwrap_err();
+        assert!(e.contains("CA_PATH/CLIENT_CERT/CLIENT_KEY"), "{e}");
+    }
+
+    #[test]
+    fn key_cert_mismatch_fails() {
+        let _g = LOCK.lock().unwrap();
+        let f = tmp_file("mismatch.env", &client_env("dev-ca.key"));
+        let e = check_config(&f).unwrap_err();
+        assert!(e.to_lowercase().contains("mismatch"), "{e}");
     }
 }

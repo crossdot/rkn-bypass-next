@@ -2,3 +2,6 @@
 
 # Dev-сертификаты/ключи, генерируемые тестами и load-harness'ами (не для git).
 deploy/dev/
+
+# Релизные артефакты (scripts/release.sh).
+dist/
