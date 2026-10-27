@@ -42,6 +42,13 @@ sudo /usr/local/bin/rkn-server --check-config /etc/netcore/server.env
 sudo systemctl restart rkn-server
 ```
 
+## Dev vs production CA key
+
+- `certs/dev-ca.key` — **dev-only**: тестовые/демо-сертификаты
+  (`docs/development/dev-certificates.md`). **Не использовать в production.**
+- Production CA key генерируется **отдельно** (openssl/CA), **никогда не
+  коммитится** в git и хранится **только** на сервере + в шифрованном бэкапе.
+
 ## Предупреждение
 
 **Потеря CA private key = перевыпуск всех клиентских сертификатов** (старые
