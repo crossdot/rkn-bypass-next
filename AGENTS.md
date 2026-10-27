@@ -73,6 +73,10 @@ Rust/Linux-система устойчивого обхода блокирово
 - Сервер `TRANSPORT=auto` (дефолт) слушает TCP+UDP; `SessionManager`, реестр
   клиентов и `inner`-верификатор общие — `max_sessions` глобальный,
   не per-transport.
+- `select()` не удерживает lock через `probe().await`: на холодном выборе —
+  singleflight (1 проба на N, остальные ждут `Notify` и берут результат из
+  кэша), `invalidate` при идущей пробе побеждает. Не возвращаться к
+  lock-through-probe (ADR-027).
 - diag-cli использует `transport-manager`, а не свою копию проверки.
 
 ## Режимы клиента (три независимые оси)

@@ -23,11 +23,16 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use config::{TransportKind, TransportPolicy, TransportStrategy};
+use tokio::sync::Notify;
 use transport_any::AnyClientTransport;
 use transport_api::{Transport, TransportError};
 
 /// Payload Ping/Pong пробы (1 байт).
 pub const PROBE_BYTE: u8 = 0x01;
+
+/// Порог (мс) для INFO-уровня метрики `transport_acquire_wait_ms`.
+/// Ниже — DEBUG: ожидания нет, это обычный выбор.
+const ACQUIRE_WAIT_INFO_MS: u64 = 100;
 
 /// Фабрика транспорта нужного типа (TLS/QUIC).
 pub type TransportFactory =
@@ -219,10 +224,25 @@ struct Entry {
     last_reason: Option<SelectReason>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct State {
     tls: Entry,
     quic: Entry,
+    /// Токен: какой транспорт сейчас в пробе (`Some` — весь цикл выбора занят).
+    probing: Option<TransportKind>,
+    /// Пробуждение ожидающих по завершении probe-цикла.
+    notify: Arc<Notify>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            tls: Entry::default(),
+            quic: Entry::default(),
+            probing: None,
+            notify: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl State {
@@ -280,146 +300,227 @@ impl TransportManager {
 
     /// Выбирает транспорт. Никогда не возвращает ошибку: при тотальном отказе
     /// возвращает `preferred` с причиной [`SelectReason::AllFailedDefault`].
+    ///
+    /// Проба идёт по singleflight: лок **не** держится через
+    /// [`Self::probe_with_attempts`]; остальные acquire ждут результат через
+    /// `Notify` (ADR-027). Метрика `transport_acquire_wait_ms` — INFO при
+    /// ожидании ≥ [`ACQUIRE_WAIT_INFO_MS`], иначе DEBUG.
     pub async fn select(&self) -> Selection {
+        let start = Instant::now();
+        let sel = self.emit(self.select_inner().await);
+        let wait_ms = start.elapsed().as_millis() as u64;
+        let event = "transport_acquire_wait_ms";
+        if wait_ms >= ACQUIRE_WAIT_INFO_MS {
+            tracing::info!(
+                event = %event,
+                transport = %kind_str(sel.kind),
+                reason = %sel.reason.as_str(),
+                strategy = %strategy_str(self.policy.strategy),
+                wait_ms = wait_ms,
+            );
+        } else {
+            tracing::debug!(
+                event = %event,
+                transport = %kind_str(sel.kind),
+                reason = %sel.reason.as_str(),
+                strategy = %strategy_str(self.policy.strategy),
+                wait_ms = wait_ms,
+            );
+        }
+        sel
+    }
+
+    /// Логика выбора без метрики: singleflight-цикл.
+    async fn select_inner(&self) -> Selection {
         let order = self.policy.order();
 
         // Явный транспорт: без проб и кэша.
         if order.len() == 1 {
-            return self.emit(Selection {
+            return Selection {
                 kind: order[0],
                 reason: SelectReason::Manual,
                 fallback_from: None,
                 fail_count: 0,
                 cached_age: None,
                 probed: Vec::new(),
-            });
+            };
         }
 
-        let mut state = self.state.lock().await;
-        let now = self.clock.now();
         let mut probed: Vec<(TransportKind, Duration)> = Vec::new();
         let mut first_failure: Option<SelectReason> = None;
         let mut last_failed: Option<(TransportKind, u32)> = None;
+        let mut idx = 0usize;
 
-        for (idx, kind) in order.iter().copied().enumerate() {
-            // Кэш: успех в пределах TTL — проба не нужна.
-            if let Some(until) = state.get(kind).ok_until {
-                if now < until {
-                    let e = state.get(kind);
-                    let cached_age = self.policy.ttl.saturating_sub(until - now);
-                    let reason = if idx == 0 {
-                        SelectReason::CachedOk
-                    } else {
-                        first_failure.unwrap_or(SelectReason::FallbackPrevFailed)
-                    };
-                    return self.emit(Selection {
-                        kind,
-                        reason,
-                        fallback_from: (idx > 0).then(|| order[0]),
-                        fail_count: e.fail_count,
-                        cached_age: Some(cached_age),
-                        probed,
-                    });
-                }
-            }
+        'outer: loop {
+            let mut state = self.state.lock().await;
+            let now = self.clock.now();
 
-            // Backoff: не повторяем пробу до `blocked_until`.
-            if let Some(until) = state.get(kind).blocked_until {
-                if now < until {
-                    let e = state.get(kind);
-                    let reason = e
-                        .last_reason
-                        .or_else(|| e.last_failure.as_ref().map(SelectReason::from))
-                        .unwrap_or(SelectReason::FallbackPrevFailed);
-                    if idx == 0 && first_failure.is_none() {
-                        first_failure = Some(reason);
+            // Первый кандидат: cached → вернуть; blocked → пропустить;
+            // иначе нужна проба.
+            let mut target = None;
+            let mut target_idx = idx;
+            while target_idx < order.len() {
+                let kind = order[target_idx];
+                let e = state.get(kind);
+                if let Some(until) = e.ok_until {
+                    if now < until {
+                        let cached_age = self.policy.ttl.saturating_sub(until - now);
+                        let reason = if target_idx == 0 {
+                            SelectReason::CachedOk
+                        } else {
+                            first_failure.unwrap_or(SelectReason::FallbackPrevFailed)
+                        };
+                        return Selection {
+                            kind,
+                            reason,
+                            fallback_from: (target_idx > 0).then(|| order[0]),
+                            fail_count: e.fail_count,
+                            cached_age: Some(cached_age),
+                            probed: std::mem::take(&mut probed),
+                        };
                     }
-                    last_failed = Some((kind, e.fail_count));
-                    continue;
                 }
+                if let Some(until) = e.blocked_until {
+                    if now < until {
+                        let reason = e
+                            .last_reason
+                            .or_else(|| e.last_failure.as_ref().map(SelectReason::from))
+                            .unwrap_or(SelectReason::FallbackPrevFailed);
+                        if target_idx == 0 && first_failure.is_none() {
+                            first_failure = Some(reason);
+                        }
+                        last_failed = Some((kind, e.fail_count));
+                        target_idx += 1;
+                        continue;
+                    }
+                }
+                target = Some(kind);
+                break;
             }
+
+            // Все кандидаты в backoff (или order пуст) → preferred.
+            let Some(kind) = target else {
+                let (last_kind, last_count) = last_failed.unwrap_or((order[0], 0));
+                return Selection {
+                    kind: order[0],
+                    reason: SelectReason::AllFailedDefault,
+                    fallback_from: (last_kind != order[0]).then_some(last_kind),
+                    fail_count: last_count,
+                    cached_age: None,
+                    probed: std::mem::take(&mut probed),
+                };
+            };
+
+            // Singleflight: кто-то уже пробит — ждём результат.
+            if state.probing.is_some() {
+                let notify = state.notify.clone();
+                drop(state);
+                notify.notified().await;
+                continue 'outer;
+            }
+
+            // Мы — единственный пробирщик на весь цикл: лок отпускается
+            // до `probe_with_attempts().await`.
+            state.probing = Some(kind);
+            drop(state);
 
             let report = self.probe_with_attempts(kind).await;
             probed.push((kind, report.elapsed));
             let at = self.clock.now();
 
-            match report.failure {
-                None => {
-                    let e = state.get_mut(kind);
-                    e.ok_until = Some(at + self.policy.ttl);
-                    e.blocked_until = None;
-                    e.fail_count = 0;
-                    e.last_failure = None;
-                    e.last_reason = None;
-                    let reason = if idx == 0 {
-                        SelectReason::ProbeOk
-                    } else {
-                        first_failure.unwrap_or(SelectReason::FallbackPrevFailed)
-                    };
-                    return self.emit(Selection {
-                        kind,
-                        reason,
-                        fallback_from: (idx > 0).then(|| order[0]),
-                        fail_count: 0,
-                        cached_age: None,
-                        probed,
-                    });
-                }
-                Some(failure) => {
-                    let reason = SelectReason::from(&failure);
-                    let e = state.get_mut(kind);
-                    e.ok_until = None;
-                    e.fail_count = e.fail_count.saturating_add(1);
-                    let backoff = self.backoff(e.fail_count);
-                    e.blocked_until = Some(at + backoff);
-                    e.last_failure = Some(failure);
-                    e.last_reason = Some(reason);
-                    let fail_count = e.fail_count;
-                    tracing::warn!(
-                        event = %"transport_state",
-                        transport = %kind_str(kind),
-                        state = %"unavailable",
-                        reason = %reason.as_str(),
-                        fail_count = fail_count,
-                        until_s = backoff.as_secs(),
-                    );
-                    if idx == 0 && first_failure.is_none() {
-                        first_failure = Some(reason);
+            let mut state = self.state.lock().await;
+            if state.probing == Some(kind) {
+                // Мы всё ещё владеем токеном (invalidate не снял).
+                match report.failure {
+                    None => {
+                        let e = state.get_mut(kind);
+                        e.ok_until = Some(at + self.policy.ttl);
+                        e.blocked_until = None;
+                        e.fail_count = 0;
+                        e.last_failure = None;
+                        e.last_reason = None;
+                        state.probing = None;
+                        state.notify.notify_waiters();
+                        let reason = if target_idx == 0 {
+                            SelectReason::ProbeOk
+                        } else {
+                            first_failure.unwrap_or(SelectReason::FallbackPrevFailed)
+                        };
+                        return Selection {
+                            kind,
+                            reason,
+                            fallback_from: (target_idx > 0).then(|| order[0]),
+                            fail_count: 0,
+                            cached_age: None,
+                            probed: std::mem::take(&mut probed),
+                        };
                     }
-                    last_failed = Some((kind, fail_count));
+                    Some(failure) => {
+                        let reason = SelectReason::from(&failure);
+                        let e = state.get_mut(kind);
+                        e.ok_until = None;
+                        e.fail_count = e.fail_count.saturating_add(1);
+                        let backoff = self.backoff(e.fail_count);
+                        e.blocked_until = Some(at + backoff);
+                        e.last_failure = Some(failure);
+                        e.last_reason = Some(reason);
+                        let fail_count = e.fail_count;
+                        tracing::warn!(
+                            event = %"transport_state",
+                            transport = %kind_str(kind),
+                            state = %"unavailable",
+                            reason = %reason.as_str(),
+                            fail_count = fail_count,
+                            until_s = backoff.as_secs(),
+                        );
+                        state.probing = None;
+                        state.notify.notify_waiters();
+                        if target_idx == 0 && first_failure.is_none() {
+                            first_failure = Some(reason);
+                        }
+                        last_failed = Some((kind, fail_count));
+                        idx = target_idx + 1;
+                        drop(state);
+                        continue 'outer;
+                    }
                 }
+            } else {
+                // invalidate снял токен → результат пробы отбрасываем:
+                // blocked_until от invalidate сохраняется, ok_until не пишем.
+                state.notify.notify_waiters();
+                drop(state);
+                continue 'outer;
             }
         }
-
-        // Все кандидаты недоступны → preferred (детерминированно), не «последний
-        // успешный»: иначе при флапе выбор осциллирует.
-        let (last_kind, last_count) = last_failed.unwrap_or((order[0], 0));
-        self.emit(Selection {
-            kind: order[0],
-            reason: SelectReason::AllFailedDefault,
-            fallback_from: (last_kind != order[0]).then_some(last_kind),
-            fail_count: last_count,
-            cached_age: None,
-            probed,
-        })
     }
 
     /// Помечает транспорт недоступным по итогу реального соединения
     /// (ошибка транспортного уровня, а не ответ цели).
+    ///
+    /// Singleflight (ADR-027): если этот транспорт сейчас в пробе — снимаем
+    /// токен, чтобы результат пробы не перезаписал `blocked_until`. `invalidate`
+    /// побеждает: `ok_until` не пишется, `blocked_until` сохраняется.
     pub async fn invalidate(&self, kind: TransportKind, reason: SelectReason) {
         let mut state = self.state.lock().await;
-        let e = state.get_mut(kind);
-        e.ok_until = None;
-        e.fail_count = e.fail_count.saturating_add(1);
-        let backoff = self.backoff(e.fail_count);
-        e.blocked_until = Some(self.clock.now() + backoff);
-        e.last_reason = Some(reason);
+        let (fail_count, backoff) = {
+            let e = state.get_mut(kind);
+            e.ok_until = None;
+            e.fail_count = e.fail_count.saturating_add(1);
+            let backoff = self.backoff(e.fail_count);
+            e.blocked_until = Some(self.clock.now() + backoff);
+            e.last_reason = Some(reason);
+            (e.fail_count, backoff)
+        };
+        if state.probing == Some(kind) {
+            state.probing = None;
+            state.notify.notify_waiters();
+        }
         tracing::warn!(
             event = %"transport_state",
             transport = %kind_str(kind),
             state = %"unavailable",
             reason = %reason.as_str(),
-            fail_count = e.fail_count,
+            fail_count = fail_count,
             until_s = backoff.as_secs(),
         );
     }
@@ -651,7 +752,9 @@ fn probe_ms(probed: &[(TransportKind, Duration)], kind: TransportKind) -> String
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::sync::{Barrier, Notify};
 
     /// Управляемые часы: TTL/backoff проверяются без `sleep`.
     struct ManualClock(Mutex<Instant>);
@@ -673,9 +776,15 @@ mod tests {
     }
 
     /// Mock-проба: поведение задаётся на транспорт, вызовы считаются.
+    /// `gate` (опционально) блокирует пробу до `notify_waiters()` — для
+    /// детерминированных concurrency-тестов (singleflight).
     struct MockProbe {
         behavior: Mutex<HashMap<TransportKind, Option<ProbeFailure>>>,
         calls: Mutex<Vec<TransportKind>>,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        gate: Option<Arc<Notify>>,
+        released: AtomicBool,
     }
 
     impl MockProbe {
@@ -683,6 +792,21 @@ mod tests {
             Self {
                 behavior: Mutex::new(HashMap::new()),
                 calls: Mutex::new(Vec::new()),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                gate: None,
+                released: AtomicBool::new(false),
+            }
+        }
+
+        fn with_gate(gate: Arc<Notify>) -> Self {
+            Self {
+                behavior: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                gate: Some(gate),
+                released: AtomicBool::new(false),
             }
         }
 
@@ -693,12 +817,27 @@ mod tests {
         fn calls(&self) -> Vec<TransportKind> {
             self.calls.lock().unwrap().clone()
         }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl Probe for MockProbe {
         async fn probe(&self, kind: TransportKind) -> ProbeReport {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             self.calls.lock().unwrap().push(kind);
+            if let Some(g) = &self.gate {
+                // Одноразовый gate: блокируем только первую пробу (пока тест
+                // не отпустит). Последующие (fallback) пробы не блокируем.
+                if !self.released.load(Ordering::SeqCst) {
+                    g.notified().await;
+                    self.released.store(true, Ordering::SeqCst);
+                }
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let failure = self.behavior.lock().unwrap().get(&kind).cloned().flatten();
             ProbeReport {
                 kind,
@@ -891,5 +1030,247 @@ mod tests {
         assert!(logs_contain("fallback_from=quic"));
         assert!(logs_contain("event=transport_state"));
         assert!(logs_contain("state=unavailable"));
+    }
+
+    // ---- ADR-027: singleflight ----
+
+    /// 100 одновременных acquire на холодном кэше → ровно 1 проба, остальные
+    /// ждут через `Notify` и берут результат из кэша. Лок не держится через
+    /// `probe().await`.
+    #[tokio::test]
+    async fn concurrency_cold_select_single_probe() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Arc::new(Notify::new());
+        let probe = Arc::new(MockProbe::with_gate(gate.clone()));
+        probe.set(TransportKind::Tls, None);
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let barrier = Arc::new(Barrier::new(100 + 1));
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            set.spawn(async move {
+                barrier.wait().await;
+                mgr.select().await
+            });
+        }
+        barrier.wait().await; // стартуют одновременно
+
+        // Первая проба в полёте (блокирована на gate).
+        while probe.max_in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.calls().len(), 1, "singleflight: 1 проба, не N");
+        assert!(probe.max_in_flight() <= 1, "нет параллельных проб");
+
+        gate.notify_waiters();
+
+        let mut probe_ok = 0;
+        let mut cached_ok = 0;
+        while let Some(res) = set.join_next().await {
+            let sel = res.unwrap();
+            assert_eq!(sel.kind, TransportKind::Tls, "все выбрали TLS");
+            match sel.reason {
+                SelectReason::ProbeOk => probe_ok += 1,
+                SelectReason::CachedOk => cached_ok += 1,
+                r => panic!("неожиданная причина {r:?}"),
+            }
+        }
+        assert_eq!(probe.calls().len(), 1, "всего одна проба на 100 acquire");
+        assert_eq!(probe_ok, 1, "один пробил");
+        assert_eq!(cached_ok, 99, "остальные взяли из кэша");
+    }
+
+    /// 100 acquire в пределах TTL → 0 новых проб (кэш).
+    #[tokio::test]
+    async fn ttl_100_acquires_zero_probes() {
+        let clock = Arc::new(ManualClock::new());
+        let probe = Arc::new(MockProbe::new());
+        probe.set(TransportKind::Tls, None);
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let first = mgr.select().await;
+        assert_eq!(first.reason, SelectReason::ProbeOk);
+        assert_eq!(probe.calls().len(), 1);
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let mgr = mgr.clone();
+            set.spawn(async move { mgr.select().await });
+        }
+        while let Some(res) = set.join_next().await {
+            let sel = res.unwrap();
+            assert_eq!(sel.kind, TransportKind::Tls);
+            assert_eq!(sel.reason, SelectReason::CachedOk);
+        }
+        assert_eq!(
+            probe.calls().len(),
+            1,
+            "в пределах TTL пробы не повторяются"
+        );
+    }
+
+    /// Проба упала → blocked_until; 100 acquire в пределах backoff → 0 проб.
+    #[tokio::test]
+    async fn backoff_concurrent_no_reprobe() {
+        let clock = Arc::new(ManualClock::new());
+        let probe = Arc::new(MockProbe::new());
+        probe.set(TransportKind::Tls, Some(ProbeFailure::TlsRefused));
+        probe.set(TransportKind::Quic, Some(ProbeFailure::ServerUnreachable));
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let first = mgr.select().await;
+        assert_eq!(first.reason, SelectReason::AllFailedDefault);
+        assert_eq!(probe.calls().len(), 2, "по одной пробе на транспорт");
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..100 {
+            let mgr = mgr.clone();
+            set.spawn(async move { mgr.select().await });
+        }
+        while let Some(res) = set.join_next().await {
+            let sel = res.unwrap();
+            assert_eq!(sel.reason, SelectReason::AllFailedDefault);
+        }
+        assert_eq!(
+            probe.calls().len(),
+            2,
+            "backoff: 0 новых проб в пределах паузы"
+        );
+    }
+
+    /// `invalidate` во время пробы побеждает: результат пробы отбрасывается,
+    /// `blocked_until` от invalidate сохраняется, `ok_until` не пишется.
+    #[tokio::test]
+    async fn invalidate_during_probe_wins() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Arc::new(Notify::new());
+        let probe = Arc::new(MockProbe::with_gate(gate.clone()));
+        probe.set(TransportKind::Tls, None); // проба была бы успешной
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let handle = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.select().await })
+        };
+        while probe.max_in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.calls().len(), 1, "TLS в полёте");
+
+        // invalidate во время пробы.
+        mgr.invalidate(TransportKind::Tls, SelectReason::TlsRefused)
+            .await;
+
+        // Отпускаем gate: проба завершается, но её результат отбрасывается.
+        gate.notify_waiters();
+        let sel = handle.await.unwrap();
+
+        let s = mgr.state.lock().await;
+        let tls = s.get(TransportKind::Tls);
+        assert!(tls.ok_until.is_none(), "результат пробы TLS не записан");
+        assert!(
+            tls.blocked_until.is_some(),
+            "blocked_until от invalidate сохранён"
+        );
+        assert_eq!(tls.fail_count, 1);
+        drop(s);
+
+        assert_eq!(
+            sel.kind,
+            TransportKind::Quic,
+            "после invalidate — fallback на QUIC"
+        );
+        assert_eq!(sel.reason, SelectReason::TlsRefused);
+    }
+
+    /// Churn (P11 regression): быстрые connect/disconnect — 0 probe storm.
+    #[tokio::test]
+    async fn churn_no_probe_storm() {
+        let clock = Arc::new(ManualClock::new());
+        let probe = Arc::new(MockProbe::new());
+        probe.set(TransportKind::Tls, None);
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let _ = mgr.select().await; // warmup: 1 проба
+        assert_eq!(probe.calls().len(), 1);
+
+        // Быстрые connect/disconnect в пределах TTL → 0 новых проб.
+        for _ in 0..200 {
+            let _ = mgr.select().await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            probe.calls().len(),
+            1,
+            "churn в пределах TTL: probe storm нет"
+        );
+
+        // После истечения TTL — снова ровно 1 новая проба (не N).
+        clock.advance(Duration::from_secs(301));
+        let _ = mgr.select().await;
+        assert_eq!(probe.calls().len(), 2, "после TTL ровно 1 новая проба");
+    }
+
+    /// Пока проба в полёте (gate), лок свободен: второй acquire не блокируется
+    /// на `Mutex`, а ждёт `Notify`. Если бы лок держался через `probe()` —
+    /// `lock()` не прошёл бы за таймаут.
+    #[tokio::test]
+    async fn lock_not_held_through_probe() {
+        let clock = Arc::new(ManualClock::new());
+        let gate = Arc::new(Notify::new());
+        let probe = Arc::new(MockProbe::with_gate(gate.clone()));
+        probe.set(TransportKind::Tls, None);
+        probe.set(TransportKind::Quic, None);
+        let mgr = Arc::new(manager(
+            policy(TransportKind::Tls),
+            probe.clone(),
+            clock.clone(),
+        ));
+
+        let handle = {
+            let mgr = mgr.clone();
+            tokio::spawn(async move { mgr.select().await })
+        };
+        while probe.max_in_flight() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // Лок доступен во время пробы (singleflight снял его до probe()).
+        let guard = tokio::time::timeout(Duration::from_millis(500), mgr.state.lock())
+            .await
+            .expect("лок свободен во время пробы");
+        assert_eq!(guard.probing, Some(TransportKind::Tls), "токен выставлен");
+        drop(guard);
+
+        gate.notify_waiters();
+        let sel = handle.await.unwrap();
+        assert_eq!(sel.kind, TransportKind::Tls);
+        assert_eq!(probe.calls().len(), 1);
     }
 }

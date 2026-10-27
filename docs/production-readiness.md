@@ -46,6 +46,7 @@
 | Пункт | Статус | Примечание |
 |---|---|---|
 | TLS + QUIC, выбор транспорта | ✅ | ADR-023 (`TRANSPORT=auto`, TTL/backoff) |
+| Холодный выбор: singleflight (1 проба на N) | ✅ | ADR-027 |
 | Двунаправленный relay без дедлока | ✅ | ADR-025 |
 | SOCKS5-режим (MVP) | ✅ | TCP CONNECT; UDP ASSOCIATE отклоняется |
 | 0-RTT/session resumption | ✅ | отключено (ADR-021/ADR-022) |
@@ -68,9 +69,10 @@
 
 ## Известные ограничения / кандидаты
 
-- **Cold-select `TransportManager::select()`** (P11): Mutex удерживается через
-  `probe().await`, худший cold ≈ 4 с; на localhost не проявляется. Кандидат на
-  **ADR-027** (singleflight / release-lock-before-probe), не блокер.
+- **Cold-select `TransportManager::select()`** — **исправлено в ADR-027**
+  (singleflight: 1 проба на N, `invalidate` при пробе побеждает, метрика
+  `transport_acquire_wait_ms`). Гистерезис переключения не реализован —
+  TTL+backoff достаточно для MVP; при необходимости ADR-028.
 - **`deploy/profiles/*/README.md`** ссылаются на артефакты, которых нет
   (nginx/, site-content/ для Profile B). Для Profile A systemd/nft закрыты.
 - **SELinux** (RHEL) не покрыт — Phase 2.
