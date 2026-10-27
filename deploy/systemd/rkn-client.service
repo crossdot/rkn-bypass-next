@@ -1,0 +1,53 @@
+[Unit]
+Description=rkn-bypass client (SOCKS5 proxy)
+Documentation=https://github.com/crossdot/rkn-bypass-next
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rkn
+Group=rkn
+EnvironmentFile=/etc/netcore/client.env
+ExecStart=/usr/local/bin/rkn-client
+Restart=on-failure
+RestartSec=5
+
+# Без привилегий: SOCKS5 на 127.0.0.1:1080 (> 1024) (ADR-026 §5).
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# Файловая система: certs/configs только чтение.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadOnlyPaths=/etc/netcore
+
+# Ядро и неймспейсы.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+
+# Сисколлы и сеть.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Ресурсы.
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=200%
+LimitNOFILE=65536
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

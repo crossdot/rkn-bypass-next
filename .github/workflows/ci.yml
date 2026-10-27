@@ -78,6 +78,28 @@ jobs:
       - name: Load smoke (P11)
         run: bash scripts/load.sh --clients 10 --transport auto --duration 30 --scenario basic
 
+  systemd-hardening:
+    name: systemd hardening (P8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # systemd-analyze --offline не требует запущенного systemd/root —
+      # парсит unit-файлы и считает exposure. Порог: < 5.0 (ADR-026).
+      - name: systemd-analyze security < 5.0
+        run: |
+          set -euo pipefail
+          for u in rkn-server rkn-client; do
+            out="$(systemd-analyze security --offline=true "deploy/systemd/$u.service")"
+            printf '%s\n' "$out" | tail -2
+            score="$(printf '%s\n' "$out" | sed -n 's/.*exposure level for [^:]*: \([0-9][0-9.]*\) .*/\1/p' | tail -1)"
+            if [ -z "$score" ]; then echo "::error::no exposure score for $u"; exit 1; fi
+            if ! awk -v s="$score" 'BEGIN{exit !(s < 5.0)}'; then
+              echo "::error::$u exposure $score >= 5.0"; exit 1
+            fi
+            echo "$u: exposure $score OK"
+          done
+
   docker-smoke:
     name: docker build + smoke + SBOM + sign (ADR-011)
     runs-on: ubuntu-latest

@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+# rkn-server: минимальный input-фильтр (ADR-026 §7).
+#
+# ВНИМАНИЕ: применять ТОЛЬКО после проверки SSH-доступа:
+#     nft -f /etc/nftables.d/rkn-server.nft
+# Иначе можно потерять SSH (policy drop). install.sh НЕ применяет файл
+# автоматически; см. docs/operations/native-install.md.
+#
+# 443/tcp — TLS, 443/udp — QUIC (TRANSPORT=auto).
+# 22/tcp  — SSH админа: заменить/добавить под свой доступ.
+# NAT не нужен: сервер — конечная точка.
+
+table inet rkn {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+
+        tcp dport 22 accept
+        tcp dport 443 accept
+        udp dport 443 accept
+
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+}

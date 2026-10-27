@@ -1,0 +1,53 @@
+[Unit]
+Description=rkn-bypass server (mTLS TLS/QUIC proxy)
+Documentation=https://github.com/crossdot/rkn-bypass-next
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rkn
+Group=rkn
+EnvironmentFile=/etc/netcore/server.env
+ExecStart=/usr/local/bin/rkn-server
+Restart=on-failure
+RestartSec=5
+
+# Привилегии: bind 443 без root (ADR-026 §4).
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Файловая система: всё read-only, certs/configs только чтение.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadOnlyPaths=/etc/netcore
+
+# Ядро и неймспейсы.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+
+# Сисколлы и сеть.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Ресурсы (P11: пик RSS ~222 MB при max_sessions=750; ADR-026 §6).
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=200%
+LimitNOFILE=65536
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target

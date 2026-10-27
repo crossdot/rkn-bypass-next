@@ -4,7 +4,8 @@
 Не требует nginx, фейкового сайта или Reality.
 
 Артефакты:
-- server.example.toml
-- systemd/
+- конфиг: `configs/server.direct.example.toml`
+- systemd: `deploy/systemd/` (`rkn-server.service` + env-пример)
+- nftables: `deploy/nftables/rkn-server.nft`
 
-Запуск: см. корневой README.
+Установка: `docs/operations/native-install.md`.
